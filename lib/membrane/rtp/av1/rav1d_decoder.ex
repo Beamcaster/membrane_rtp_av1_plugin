@@ -82,14 +82,10 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
 
   # Decode a complete AV1 temporal unit
   defp decode_temporal_unit(temporal_unit, pts, state) do
-    Membrane.Logger.warning("""
-    Decoding temporal unit:
-    - Size: #{byte_size(temporal_unit)} bytes
-    - First 32 bytes (hex): #{temporal_unit |> binary_part(0, min(32, byte_size(temporal_unit))) |> Base.encode16(case: :lower)}
-    """)
-
     case Rav1dEx.decode_access_unit(state.decoder, temporal_unit) do
       {:ok, frames} when is_list(frames) and frames != [] ->
+        Membrane.Logger.info("Decoded #{length(frames)} frames")
+
         process_decoded_frames(frames, pts, state)
 
       {:ok, []} ->
@@ -135,7 +131,7 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
       height: frame.height,
       pixel_format: :I420,
       aligned: true,
-      framerate: nil
+      framerate: 30
     }
 
     Membrane.Logger.info(
