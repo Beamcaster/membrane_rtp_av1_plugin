@@ -73,7 +73,7 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
     %Buffer{payload: temporal_unit, pts: pts} = buffer
 
     if byte_size(temporal_unit) == 0 do
-      Membrane.Logger.debug("Empty temporal unit received, skipping")
+      Membrane.Logger.warning("Empty temporal unit received, skipping")
       {[], state}
     else
       decode_temporal_unit(temporal_unit, pts, state)
@@ -82,7 +82,7 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
 
   # Decode a complete AV1 temporal unit
   defp decode_temporal_unit(temporal_unit, pts, state) do
-    Membrane.Logger.debug("""
+    Membrane.Logger.warning("""
     Decoding temporal unit:
     - Size: #{byte_size(temporal_unit)} bytes
     - First 32 bytes (hex): #{temporal_unit |> binary_part(0, min(32, byte_size(temporal_unit))) |> Base.encode16(case: :lower)}
@@ -94,7 +94,7 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
 
       {:ok, []} ->
         # Decoder needs more data (e.g., buffering for B-frames)
-        Membrane.Logger.debug("Decoder needs more data (no frames output yet)")
+        Membrane.Logger.warning("Decoder needs more data (no frames output yet)")
         {[], state}
 
       {:error, reason} ->
@@ -155,7 +155,8 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
     # Use frame timestamp if available, otherwise use buffer PTS
     output_pts =
       if frame.timestamp != 0 do
-        Membrane.Time.seconds(frame.timestamp / state.clock_rate)
+        # Membrane.Time.seconds(frame.timestamp / state.clock_rate)
+        Membrane.Time.seconds(frame.timestamp)
       else
         pts
       end
