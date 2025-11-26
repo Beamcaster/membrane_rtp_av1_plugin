@@ -30,19 +30,23 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
   alias Membrane.{Buffer, RawVideo}
   alias Membrane.RTP.AV1.Format
 
-  def_input_pad :input,
+  def_input_pad(:input,
     accepted_format: Format,
     flow_control: :auto
+  )
 
-  def_output_pad :output,
+  def_output_pad(:output,
     accepted_format: RawVideo,
     flow_control: :auto
+  )
 
-  def_options clock_rate: [
-                spec: pos_integer(),
-                default: 90_000,
-                description: "RTP clock rate in Hz for PTS conversion (default: 90000 for video)"
-              ]
+  def_options(
+    clock_rate: [
+      spec: pos_integer(),
+      default: 90_000,
+      description: "RTP clock rate in Hz for PTS conversion (default: 90000 for video)"
+    ]
+  )
 
   @impl true
   def handle_init(_ctx, opts) do
@@ -151,8 +155,9 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
     # Use frame timestamp if available, otherwise use buffer PTS
     output_pts =
       if frame.timestamp != 0 do
-        # Membrane.Time.seconds(frame.timestamp / state.clock_rate)
-        Membrane.Time.seconds(frame.timestamp)
+        frame.timestamp
+        |> div(state.clock_rate)
+        |> Membrane.Time.seconds()
       else
         pts
       end

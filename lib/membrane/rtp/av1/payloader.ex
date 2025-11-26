@@ -14,38 +14,42 @@ defmodule Membrane.RTP.AV1.Payloader do
   alias Membrane.Buffer
   alias Membrane.RTP.AV1.{PayloadFormat, Format}
 
-  def_input_pad :input,
+  def_input_pad(:input,
     accepted_format: Format
+  )
 
-  def_output_pad :output,
+  def_output_pad(:output,
     accepted_format: Membrane.RTP
+  )
 
-  def_options mtu: [
-                spec: pos_integer(),
-                default: 1200,
-                description:
-                  "Maximum RTP payload size in bytes. Default: 1200 (safe), Max: 9000 (jumbo frames). Can be changed dynamically via MTUUpdateEvent."
-              ],
-              fmtp: [
-                spec: map(),
-                default: %{},
-                description: "SDP fmtp parameters map (e.g., cm, tid, lid)"
-              ],
-              payload_type: [
-                spec: 0..127,
-                default: 96,
-                description: "RTP dynamic payload type for AV1"
-              ],
-              clock_rate: [
-                spec: pos_integer(),
-                default: 90_000,
-                description: "RTP clock rate"
-              ],
-              header_mode: [
-                spec: atom(),
-                default: :draft,
-                description: "Header encoding mode for AV1 RTP payloads"
-              ]
+  def_options(
+    mtu: [
+      spec: pos_integer(),
+      default: 1200,
+      description:
+        "Maximum RTP payload size in bytes. Default: 1200 (safe), Max: 9000 (jumbo frames). Can be changed dynamically via MTUUpdateEvent."
+    ],
+    fmtp: [
+      spec: map(),
+      default: %{},
+      description: "SDP fmtp parameters map (e.g., cm, tid, lid)"
+    ],
+    payload_type: [
+      spec: 0..127,
+      default: 45,
+      description: "RTP dynamic payload type for AV1"
+    ],
+    clock_rate: [
+      spec: pos_integer(),
+      default: 90_000,
+      description: "RTP clock rate"
+    ],
+    header_mode: [
+      spec: atom(),
+      default: :draft,
+      description: "Header encoding mode for AV1 RTP payloads"
+    ]
+  )
 
   # MTU constraints
   @min_mtu 64
@@ -68,7 +72,15 @@ defmodule Membrane.RTP.AV1.Payloader do
   end
 
   @impl true
-  def handle_stream_format(:input, _stream_format, _ctx, state), do: {[], state}
+  def handle_stream_format(:input, stream_format, _ctx, state) do
+    dbg(stream_format)
+
+    stream_format = %Membrane.RTP{
+      # clock_rate: 90_000
+    }
+
+    {[stream_format: {:output, stream_format}], state}
+  end
 
   @impl true
   def handle_event(_pad, %Membrane.RTP.AV1.MTUUpdateEvent{mtu: new_mtu}, _ctx, state) do
@@ -96,7 +108,7 @@ defmodule Membrane.RTP.AV1.Payloader do
   end
 
   @impl true
-  def handle_buffer(:input, %Buffer{payload: access_unit, pts: pts} = _buffer, _ctx, state) do
+  def handle_buffer(:input, %Buffer{payload: access_unit, pts: pts} = buffer, _ctx, state) do
     header_mode = Map.get(state, :header_mode, :draft)
 
     # Use TU-aware fragmentation for proper marker bit placement

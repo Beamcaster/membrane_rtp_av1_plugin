@@ -8,12 +8,11 @@ defmodule Membrane.RTP.AV1.SDP do
 
   ## Examples
 
-      iex> Membrane.RTP.AV1.SDP.rtpmap(96)
-      "a=rtpmap:96 AV1/90000"
+      iex> Membrane.RTP.AV1.SDP.rtpmap(45)
+      "a=rtpmap:45 AV1/90000"
 
-      iex> Membrane.RTP.AV1.SDP.rtpmap(96, profile: 0)
-      "a=rtpmap:96 AV1/90000"
-
+      iex> Membrane.RTP.AV1.SDP.rtpmap(45, profile: 0)
+      "a=rtpmap:45 AV1/90000"
   """
 
   @clock_rate 90_000
@@ -49,8 +48,8 @@ defmodule Membrane.RTP.AV1.SDP do
 
   ## Examples
 
-      iex> Membrane.RTP.AV1.SDP.rtpmap(96)
-      "a=rtpmap:96 AV1/90000"
+      iex> Membrane.RTP.AV1.SDP.rtpmap(45)
+      "a=rtpmap:45 AV1/90000"
 
       iex> Membrane.RTP.AV1.SDP.rtpmap(100)
       "a=rtpmap:100 AV1/90000"

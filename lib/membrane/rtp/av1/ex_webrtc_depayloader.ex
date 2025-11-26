@@ -13,9 +13,23 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   ## Features
 
   - Handles OBU fragmentation via Z/Y bits
+  - Properly handles N bit for coded video sequence boundaries
   - Assembles complete temporal units when marker bit is set
   - Adds temporal delimiter OBU to output temporal units
-  - Handles packet reordering within configurable buffer size
+  - Caches and manages sequence headers across coded video sequences
+  - Handles sequence header changes (resolution/profile changes mid-stream)
+
+  ## Aggregation Header Format (Section 4.4 of RTP spec)
+
+      0 1 2 3 4 5 6 7
+      +-+-+-+-+-+-+-+-+
+      |Z|Y| W |N|-|-|-|
+      +-+-+-+-+-+-+-+-+
+
+  - Z: First OBU element is continuation of previous packet's fragment
+  - Y: Last OBU element will continue in next packet
+  - W: Number of OBU elements (0 = use length fields, 1-3 = count, last has no length)
+  - N: First packet of a coded video sequence (new sequence header expected)
   """
 
   use Membrane.Filter
@@ -26,13 +40,25 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   alias Membrane.RTP.AV1.Format
   alias Membrane.RTP.AV1.ExWebRTC.{LEB128, Payload}
 
-  # Import Bitwise for OBU parsing operations
   import Bitwise
 
-  # OBU type constants
+  # =============================================================================
+  # OBU Type Constants (AV1 Spec Section 6.2.2)
+  # =============================================================================
+
   @obu_sequence_header 1
   @obu_temporal_delimiter 2
+  @obu_frame_header 3
+  @obu_tile_group 4
+  @obu_metadata 5
   @obu_frame 6
+  @obu_redundant_frame_header 7
+  @obu_tile_list 8
+  @obu_padding 15
+
+  # =============================================================================
+  # Membrane Pad Definitions
+  # =============================================================================
 
   def_input_pad :input,
     accepted_format: RTP,
@@ -50,28 +76,71 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
               require_sequence_header: [
                 spec: boolean(),
                 default: true,
-                description:
-                  "When true, cache and prepend sequence headers for AV1 decoder initialization. " <>
-                    "If a frame arrives without a cached sequence header, a keyframe request will be emitted. " <>
-                    "Enable this for decoders that require sequence header initialization (e.g., rav1d)."
+                description: """
+                When true, cache and prepend sequence headers for AV1 decoder initialization.
+                If a frame arrives without a cached sequence header, a keyframe request will be emitted.
+                Enable this for decoders that require sequence header initialization (e.g., rav1d).
+                """
               ]
+
+  # =============================================================================
+  # State Definition
+  # =============================================================================
+
+  defmodule State do
+    @moduledoc false
+
+    @type t :: %__MODULE__{
+            current_temporal_unit: binary() | nil,
+            current_timestamp: non_neg_integer() | nil,
+            current_obu_fragment: binary() | nil,
+            max_reorder_buffer: pos_integer(),
+            require_sequence_header: boolean(),
+            stream_format_sent: boolean(),
+            cached_sequence_header: binary() | nil,
+            sequence_header_generation: non_neg_integer(),
+            waiting_for_keyframe: boolean(),
+            waiting_for_sequence_header: boolean(),
+            last_n_bit_timestamp: non_neg_integer() | nil,
+            frames_since_sequence_header: non_neg_integer()
+          }
+
+    defstruct [
+      # Current temporal unit being assembled (multiple OBUs)
+      current_temporal_unit: nil,
+      # RTP timestamp of current temporal unit
+      current_timestamp: nil,
+      # OBU fragment being assembled across packets (Z/Y fragmentation)
+      current_obu_fragment: nil,
+      # Configuration
+      max_reorder_buffer: 10,
+      require_sequence_header: true,
+      # Stream format tracking
+      stream_format_sent: false,
+      # Sequence header management
+      cached_sequence_header: nil,
+      # Incremented each time sequence header changes (for debugging/tracking)
+      sequence_header_generation: 0,
+      # True when we've requested a keyframe and are waiting for it
+      waiting_for_keyframe: false,
+      # True when N=1 was seen but sequence header not yet received
+      waiting_for_sequence_header: false,
+      # Timestamp when we last saw N=1
+      last_n_bit_timestamp: nil,
+      # Count of frames output since last sequence header (for diagnostics)
+      frames_since_sequence_header: 0
+    ]
+  end
+
+  # =============================================================================
+  # Membrane Callbacks
+  # =============================================================================
 
   @impl true
   def handle_init(_ctx, opts) do
-    state = %{
-      # Current temporal unit being assembled
-      current_temporal_unit: nil,
-      current_timestamp: nil,
-      # OBU fragment being assembled (across packets)
-      current_obu_fragment: nil,
-      # Configuration
+    state = %State{
       max_reorder_buffer: opts.max_reorder_buffer,
-      require_sequence_header: opts.require_sequence_header,
-      # Stream format tracking
-      stream_format_sent: false,
-      # Sequence header caching for AV1 decoder initialization
-      cached_sequence_header: nil,
-      waiting_for_keyframe: false
+      require_sequence_header: opts.require_sequence_header
     }
 
     {[], state}
@@ -86,15 +155,9 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
   @impl true
   def handle_buffer(:input, buffer, _ctx, state) do
-    Membrane.Logger.debug("""
-    RTP packet received:
-    - Cached seq header: #{state.cached_sequence_header != nil}
-    - Waiting for keyframe: #{state.waiting_for_keyframe}
-    """)
-
     %Buffer{payload: payload, pts: pts, metadata: metadata} = buffer
 
-    # Handle padding-only packets
+    # Handle padding-only packets (empty payload)
     if payload == <<>> do
       {[], state}
     else
@@ -103,20 +166,14 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
       case Payload.parse(payload) do
         {:ok, av1_payload} ->
-          case av1_payload.payload do
-            <<header::8, _::binary>> ->
-              obu_type = header >>> 3 &&& 0x0F
-              Membrane.Logger.debug("Received OBU type: #{obu_type} (#{obu_type_name(obu_type)})")
-            _ ->
-              :ok
-          end
-
+          log_packet_debug(state, av1_payload, rtp_timestamp, marker)
           do_depayload(state, av1_payload, rtp_timestamp, marker, pts)
 
         {:error, reason} ->
           Membrane.Logger.warning("""
-          Couldn't parse AV1 payload, reason: #{reason}. \
-          Resetting depayloader state. Payload: #{inspect(payload)}.\
+          Couldn't parse AV1 payload, reason: #{inspect(reason)}.
+          Resetting depayloader state.
+          Payload (first 32 bytes): #{inspect(binary_part(payload, 0, min(32, byte_size(payload))))}
           """)
 
           {[], reset_depayloader(state)}
@@ -124,184 +181,330 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     end
   end
 
-  defp obu_type_name(1), do: "SEQUENCE_HEADER"
-  defp obu_type_name(2), do: "TEMPORAL_DELIMITER"
-  defp obu_type_name(3), do: "FRAME_HEADER"
-  defp obu_type_name(6), do: "FRAME"
+  # =============================================================================
+  # Debug Logging
+  # =============================================================================
+
+  defp log_packet_debug(state, av1_payload, timestamp, marker) do
+    obu_types = list_obu_types(av1_payload.payload)
+
+    Membrane.Logger.info("""
+    RTP packet received:
+    - Timestamp: #{timestamp}
+    - Marker: #{marker}
+    - Z=#{av1_payload.z}, Y=#{av1_payload.y}, W=#{av1_payload.w}, N=#{av1_payload.n}
+    - OBU types: #{inspect(obu_types)}
+    - Cached seq header: #{state.cached_sequence_header != nil} (gen #{state.sequence_header_generation})
+    - Waiting for keyframe: #{state.waiting_for_keyframe}
+    - Waiting for seq header: #{state.waiting_for_sequence_header}
+    """)
+  end
+
+  defp list_obu_types(data) do
+    iterate_obus(data, [], fn obu_type, acc ->
+      [obu_type_name(obu_type) | acc]
+    end)
+    |> Enum.reverse()
+  end
+
+  defp obu_type_name(@obu_sequence_header), do: "SEQUENCE_HEADER"
+  defp obu_type_name(@obu_temporal_delimiter), do: "TEMPORAL_DELIMITER"
+  defp obu_type_name(@obu_frame_header), do: "FRAME_HEADER"
+  defp obu_type_name(@obu_tile_group), do: "TILE_GROUP"
+  defp obu_type_name(@obu_metadata), do: "METADATA"
+  defp obu_type_name(@obu_frame), do: "FRAME"
+  defp obu_type_name(@obu_redundant_frame_header), do: "REDUNDANT_FRAME_HEADER"
+  defp obu_type_name(@obu_tile_list), do: "TILE_LIST"
+  defp obu_type_name(@obu_padding), do: "PADDING"
   defp obu_type_name(n), do: "TYPE_#{n}"
 
-  # Main depayloading logic using Z/Y bits for OBU fragmentation
+  # =============================================================================
+  # Main Depayloading Logic
+  # =============================================================================
+
   defp do_depayload(state, av1_payload, timestamp, marker, pts) do
-    # Handle OBU fragments based on Z and Y bits
-    # Z=0, Y=0: Single complete OBU
-    # Z=0, Y=1: First fragment of an OBU
-    # Z=1, Y=0: Last fragment of an OBU
-    # Z=1, Y=1: Middle fragment of an OBU
+    # Step 1: Handle N bit (new coded video sequence signal)
+    # Per spec section 4.4: N=1 means first packet of coded video sequence
+    state = handle_n_bit(state, av1_payload, timestamp)
 
-    state =
-      case {av1_payload.z, av1_payload.y, state.current_obu_fragment} do
-        # Single complete OBU
-        {0, 0, nil} ->
-          append_obu(state, timestamp, av1_payload.payload)
+    # Step 2: Handle OBU fragmentation using Z/Y bits
+    # Z=0,Y=0: Complete OBU(s)
+    # Z=0,Y=1: First fragment
+    # Z=1,Y=0: Last fragment
+    # Z=1,Y=1: Middle fragment
+    state = handle_obu_fragments(state, av1_payload, timestamp)
 
-        # Single complete OBU, but we have a fragment (incomplete previous OBU)
-        {0, 0, _fragment} ->
-          Membrane.Logger.debug(
-            "Received complete OBU while having incomplete fragment. Dropping fragment."
-          )
+    # Step 3: Check if we have a complete temporal unit (marker bit set)
+    maybe_emit_temporal_unit(state, marker, pts)
+  end
 
-          state
-          |> reset_obu_fragment()
-          |> append_obu(timestamp, av1_payload.payload)
+  # -----------------------------------------------------------------------------
+  # N Bit Handling (Coded Video Sequence Boundaries)
+  # -----------------------------------------------------------------------------
 
-        # First fragment of an OBU
-        {0, 1, nil} ->
-          start_obu_fragment(state, timestamp, av1_payload.payload)
+  defp handle_n_bit(state, %{n: 1} = av1_payload, timestamp) do
+    # N=1 indicates first packet of a new coded video sequence
+    # Per spec: "MUST be set to 1 if the packet is the first packet of a coded video sequence"
+    # A sequence header SHOULD be present in this temporal unit
 
-        # First fragment, but we already have a fragment
-        {0, 1, _fragment} ->
-          Membrane.Logger.debug(
-            "Received first OBU fragment while having incomplete fragment. Dropping old fragment."
-          )
+    Membrane.Logger.info("N=1: New coded video sequence starting at timestamp #{timestamp}")
 
-          state
-          |> reset_obu_fragment()
-          |> start_obu_fragment(timestamp, av1_payload.payload)
+    case extract_sequence_header(av1_payload.payload) do
+      nil ->
+        # Sequence header not in this packet - might be in next packet of same TU
+        # Or encoder might be sending it separately (less common)
+        Membrane.Logger.info(
+          "N=1 packet without sequence header - may arrive in subsequent packet"
+        )
 
-        # Last fragment of an OBU
-        {1, 0, fragment}
-        when fragment != nil and timestamp == state.current_timestamp ->
-          complete_obu = fragment <> av1_payload.payload
+        %{state | waiting_for_sequence_header: true, last_n_bit_timestamp: timestamp}
 
-          state
-          |> reset_obu_fragment()
-          |> append_obu(timestamp, complete_obu)
-
-        # Last fragment, but no current fragment or wrong timestamp
-        {1, 0, _} ->
-          Membrane.Logger.debug("Received last OBU fragment without matching first fragment. Dropping.")
-          reset_obu_fragment(state)
-
-        # Middle fragment of an OBU
-        {1, 1, fragment}
-        when fragment != nil and timestamp == state.current_timestamp ->
-          %{state | current_obu_fragment: fragment <> av1_payload.payload}
-
-        # Middle fragment, but no current fragment or wrong timestamp
-        {1, 1, _} ->
-          Membrane.Logger.debug("Received middle OBU fragment without matching first fragment. Dropping.")
-          reset_obu_fragment(state)
-      end
-
-    # Check if we have a complete temporal unit (marker bit set)
-    case {state.current_temporal_unit, marker} do
-      {nil, _} ->
-        {[], state}
-
-      {temporal_unit, true} ->
-        # Add temporal delimiter OBU at the beginning
-        complete_temporal_unit = add_temporal_delimiter() <> temporal_unit
-
-        # Build output buffer
-        {actions, new_state} = build_output(complete_temporal_unit, pts, state)
-
-        {actions, reset_depayloader(new_state)}
-
-      {_temporal_unit, false} ->
-        {[], state}
+      seq_header ->
+        handle_sequence_header_received(state, seq_header, timestamp)
     end
   end
 
-  defp append_obu(state, timestamp, obu_data) do
-    # Strip any temporal delimiter OBUs from incoming data
-    # We add a canonical temporal delimiter at the end in do_depayload/5
-    filtered_obu_data = strip_temporal_delimiters(obu_data)
+  defp handle_n_bit(state, _av1_payload, _timestamp), do: state
 
-    # If all data was temporal delimiters, nothing to append
-    if filtered_obu_data == <<>> do
-      state
-    else
-      # Cache sequence header as soon as we see it in any complete OBU
-      state = maybe_cache_sequence_header(state, filtered_obu_data)
+  defp handle_sequence_header_received(state, new_seq_header, timestamp) do
+    cond do
+      # First sequence header ever
+      state.cached_sequence_header == nil ->
+        Membrane.Logger.info("""
+        Initial sequence header received and cached
+        - Size: #{byte_size(new_seq_header)} bytes
+        - Timestamp: #{timestamp}
+        """)
 
-      cond do
-        state.current_temporal_unit == nil ->
-          %{state | current_temporal_unit: filtered_obu_data, current_timestamp: timestamp}
+        %{state |
+          cached_sequence_header: new_seq_header,
+          sequence_header_generation: 1,
+          waiting_for_keyframe: false,
+          waiting_for_sequence_header: false,
+          last_n_bit_timestamp: timestamp,
+          frames_since_sequence_header: 0
+        }
 
-        timestamp != state.current_timestamp ->
-          Membrane.Logger.debug("""
-          Received OBU with different timestamp without finishing previous temporal unit. \
-          Dropping previous temporal unit.\
-          """)
+      # Sequence header changed (resolution change, profile change, etc.)
+      new_seq_header != state.cached_sequence_header ->
+        Membrane.Logger.info("""
+        Sequence header CHANGED - new coded video sequence
+        - Previous size: #{byte_size(state.cached_sequence_header)} bytes
+        - New size: #{byte_size(new_seq_header)} bytes
+        - Generation: #{state.sequence_header_generation} -> #{state.sequence_header_generation + 1}
+        - Frames since last seq header: #{state.frames_since_sequence_header}
+        Note: Decoder may need reinitialization
+        """)
 
-          %{state | current_temporal_unit: filtered_obu_data, current_timestamp: timestamp}
+        %{state |
+          cached_sequence_header: new_seq_header,
+          sequence_header_generation: state.sequence_header_generation + 1,
+          waiting_for_keyframe: false,
+          waiting_for_sequence_header: false,
+          last_n_bit_timestamp: timestamp,
+          frames_since_sequence_header: 0
+        }
 
-        true ->
-          %{
-            state
-            | current_temporal_unit: state.current_temporal_unit <> filtered_obu_data
-          }
-      end
+      # Same sequence header (common case - keyframe with same params)
+      true ->
+        Membrane.Logger.info("Sequence header unchanged (generation #{state.sequence_header_generation})")
+
+        %{state |
+          waiting_for_keyframe: false,
+          waiting_for_sequence_header: false,
+          last_n_bit_timestamp: timestamp,
+          frames_since_sequence_header: 0
+        }
     end
   end
 
-  # Check if OBU data contains a sequence header and cache it immediately
-  defp maybe_cache_sequence_header(state, obu_data) do
-    if state.require_sequence_header and state.cached_sequence_header == nil do
-      case extract_sequence_header(obu_data) do
-        nil ->
-          state
+  # -----------------------------------------------------------------------------
+  # OBU Fragment Handling (Z/Y Bits)
+  # -----------------------------------------------------------------------------
 
-        seq_header ->
-          Membrane.Logger.info("Found and cached sequence header (#{byte_size(seq_header)} bytes)")
-          %{state | cached_sequence_header: seq_header, waiting_for_keyframe: false}
-      end
-    else
-      state
+  defp handle_obu_fragments(state, av1_payload, timestamp) do
+    case {av1_payload.z, av1_payload.y, state.current_obu_fragment} do
+      # Z=0, Y=0: Single complete OBU (or multiple complete OBUs)
+      {0, 0, nil} ->
+        append_obus(state, timestamp, av1_payload.payload)
+
+      # Z=0, Y=0: Complete OBU but we have leftover fragment (packet loss case)
+      {0, 0, _fragment} ->
+        Membrane.Logger.info(
+          "Received complete OBU while having incomplete fragment - dropping fragment (likely packet loss)"
+        )
+
+        state
+        |> reset_obu_fragment()
+        |> append_obus(timestamp, av1_payload.payload)
+
+      # Z=0, Y=1: First fragment of an OBU
+      {0, 1, nil} ->
+        start_obu_fragment(state, timestamp, av1_payload.payload)
+
+      # Z=0, Y=1: First fragment but we already have one (packet loss case)
+      {0, 1, _fragment} ->
+        Membrane.Logger.info(
+          "Received first OBU fragment while having incomplete fragment - dropping old fragment"
+        )
+
+        state
+        |> reset_obu_fragment()
+        |> start_obu_fragment(timestamp, av1_payload.payload)
+
+      # Z=1, Y=0: Last fragment of an OBU
+      {1, 0, fragment} when fragment != nil and timestamp == state.current_timestamp ->
+        complete_obu = fragment <> av1_payload.payload
+
+        state
+        |> reset_obu_fragment()
+        |> append_obus(timestamp, complete_obu)
+
+      # Z=1, Y=0: Last fragment but no matching first fragment
+      {1, 0, _} ->
+        Membrane.Logger.info(
+          "Received last OBU fragment without matching first fragment - dropping"
+        )
+
+        reset_obu_fragment(state)
+
+      # Z=1, Y=1: Middle fragment of an OBU
+      {1, 1, fragment} when fragment != nil and timestamp == state.current_timestamp ->
+        %{state | current_obu_fragment: fragment <> av1_payload.payload}
+
+      # Z=1, Y=1: Middle fragment but no matching first fragment
+      {1, 1, _} ->
+        Membrane.Logger.info(
+          "Received middle OBU fragment without matching first fragment - dropping"
+        )
+
+        reset_obu_fragment(state)
     end
   end
 
   defp start_obu_fragment(state, timestamp, fragment) do
-    if state.current_temporal_unit == nil or timestamp != state.current_timestamp do
-      if state.current_temporal_unit != nil do
-        Membrane.Logger.debug("""
-        Starting OBU fragment with different timestamp. Dropping previous temporal unit.\
-        """)
-      end
-
-      %{
-        state
-        | current_obu_fragment: fragment,
-          current_timestamp: timestamp,
-          current_temporal_unit: nil
-      }
-    else
-      %{state | current_obu_fragment: fragment}
+    if state.current_temporal_unit != nil and timestamp != state.current_timestamp do
+      Membrane.Logger.info("""
+      Starting OBU fragment with different timestamp - dropping incomplete temporal unit
+      Old timestamp: #{state.current_timestamp}, New timestamp: #{timestamp}
+      """)
     end
+
+    %{state |
+      current_obu_fragment: fragment,
+      current_timestamp: timestamp,
+      current_temporal_unit:
+        if(timestamp != state.current_timestamp, do: nil, else: state.current_temporal_unit)
+    }
   end
 
   defp reset_obu_fragment(state) do
     %{state | current_obu_fragment: nil}
   end
 
-  defp reset_depayloader(state) do
-    %{state | current_temporal_unit: nil, current_timestamp: nil, current_obu_fragment: nil}
+  # -----------------------------------------------------------------------------
+  # OBU Accumulation
+  # -----------------------------------------------------------------------------
+
+  defp append_obus(state, timestamp, obu_data) do
+    # Strip temporal delimiters - we add a canonical one at output
+    # Also strip tile list OBUs per spec: "SHOULD be removed when transmitted"
+    filtered_data = strip_unwanted_obus(obu_data)
+
+    if filtered_data == <<>> do
+      state
+    else
+      # Check for sequence header in the OBUs (may arrive without N=1 in some edge cases)
+      state = maybe_cache_sequence_header_opportunistic(state, filtered_data, timestamp)
+
+      cond do
+        # Starting new temporal unit
+        state.current_temporal_unit == nil ->
+          %{state | current_temporal_unit: filtered_data, current_timestamp: timestamp}
+
+        # Different timestamp - new temporal unit (previous one incomplete)
+        timestamp != state.current_timestamp ->
+          Membrane.Logger.info("""
+          Received OBU with different timestamp without finishing previous temporal unit
+          Old timestamp: #{state.current_timestamp}, New timestamp: #{timestamp}
+          Dropping incomplete temporal unit
+          """)
+
+          %{state | current_temporal_unit: filtered_data, current_timestamp: timestamp}
+
+        # Same timestamp - append to current temporal unit
+        true ->
+          %{state | current_temporal_unit: state.current_temporal_unit <> filtered_data}
+      end
+    end
   end
 
-  # Creates a temporal delimiter OBU
-  # According to AV1 spec section 5.5:
-  # - obu_forbidden_bit = 0 (1 bit)
-  # - obu_type = 2 (temporal delimiter) (4 bits)
-  # - obu_extension_flag = 0 (1 bit)
-  # - obu_has_size_field = 1 (1 bit)
-  # - obu_reserved_1bit = 0 (1 bit)
-  # - obu_size = 0 (since temporal delimiter has no payload)
-  defp add_temporal_delimiter do
-    <<0::1, @obu_temporal_delimiter::4, 0::1, 1::1, 0::1, 0::8>>
+  # Opportunistically cache sequence header even if N bit wasn't set
+  # This handles edge cases where sequence header arrives mid-stream
+  defp maybe_cache_sequence_header_opportunistic(state, obu_data, timestamp) do
+    if state.require_sequence_header do
+      case extract_sequence_header(obu_data) do
+        nil ->
+          state
+
+        seq_header when state.waiting_for_sequence_header ->
+          # We were expecting this after N=1
+          Membrane.Logger.info("Found sequence header after N=1 (in subsequent packet)")
+          handle_sequence_header_received(state, seq_header, timestamp)
+
+        seq_header when state.cached_sequence_header == nil ->
+          # First sequence header (even without N=1)
+          Membrane.Logger.info("Found sequence header without N=1 - caching opportunistically")
+          handle_sequence_header_received(state, seq_header, timestamp)
+
+        seq_header when seq_header != state.cached_sequence_header ->
+          # Sequence header changed without N=1 (unusual but handle it)
+          Membrane.Logger.warning("""
+          Sequence header changed WITHOUT N=1 bit set - this is unusual
+          Caching new sequence header anyway
+          """)
+          handle_sequence_header_received(state, seq_header, timestamp)
+
+        _seq_header ->
+          # Same sequence header, no change needed
+          state
+      end
+    else
+      state
+    end
+  end
+
+  # -----------------------------------------------------------------------------
+  # Temporal Unit Emission
+  # -----------------------------------------------------------------------------
+
+  defp maybe_emit_temporal_unit(state, marker, pts) do
+    case {state.current_temporal_unit, marker} do
+      {nil, _} ->
+        {[], state}
+
+      {temporal_unit, true} ->
+        # Marker bit set - temporal unit is complete
+        emit_temporal_unit(state, temporal_unit, pts)
+
+      {_temporal_unit, false} ->
+        # More packets expected for this temporal unit
+        {[], state}
+    end
+  end
+
+  defp emit_temporal_unit(state, temporal_unit, pts) do
+    # Build the complete temporal unit with proper OBU ordering:
+    # 1. Temporal Delimiter (required by some decoders)
+    # 2. Sequence Header (if needed)
+    # 3. Frame data
+
+    {actions, new_state} = build_output(temporal_unit, pts, state)
+    {actions, reset_depayloader(new_state)}
   end
 
   defp build_output(temporal_unit, pts, state) do
-    # Send stream format on first output if not sent
+    # Send stream format on first output if not already sent
     format_actions =
       if not state.stream_format_sent do
         [stream_format: {:output, %Format{}}]
@@ -309,283 +512,330 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         []
       end
 
-    # Apply sequence header caching logic if enabled
-    {buffer_actions, new_state} =
-      build_output_with_sequence_header(temporal_unit, pts, state)
+    # Build output with proper sequence header handling
+    {buffer_actions, new_state} = build_output_with_sequence_header(temporal_unit, pts, state)
 
-    new_state = %{new_state | stream_format_sent: true}
+    new_state = %{new_state |
+      stream_format_sent: true,
+      frames_since_sequence_header: new_state.frames_since_sequence_header + 1
+    }
 
     {format_actions ++ buffer_actions, new_state}
+  end
+
+  defp build_output_with_sequence_header(temporal_unit, pts, state) do
+    if not state.require_sequence_header do
+      # Sequence header management disabled - output as-is with temporal delimiter
+      output = prepend_temporal_delimiter(temporal_unit)
+      buffer = build_buffer(output, pts)
+      {[buffer: {:output, buffer}], state}
+    else
+      build_output_with_managed_sequence_header(temporal_unit, pts, state)
+    end
+  end
+
+  defp build_output_with_managed_sequence_header(temporal_unit, pts, state) do
+    # Analyze what's in this temporal unit
+    analysis = analyze_temporal_unit(temporal_unit)
+
+    # Update state with any sequence header found
+    state =
+      if analysis.sequence_header != nil and
+         (state.cached_sequence_header == nil or
+          analysis.sequence_header != state.cached_sequence_header) do
+        Membrane.Logger.info("Updating cached sequence header from temporal unit content")
+        handle_sequence_header_received(state, analysis.sequence_header, state.current_timestamp)
+      else
+        state
+      end
+
+    cond do
+      # No cached sequence header and we have frame data - can't decode, request keyframe
+      state.cached_sequence_header == nil and analysis.has_frame ->
+        Membrane.Logger.warning("""
+        Cannot output frame - no sequence header available
+        Requesting keyframe to get sequence header for decoder initialization
+        """)
+
+        {[event: {:output, %Membrane.KeyframeRequestEvent{}}],
+         %{state | waiting_for_keyframe: true}}
+
+      # Have cached sequence header but temporal unit doesn't include one - prepend it
+      state.cached_sequence_header != nil and
+        analysis.sequence_header == nil and
+        analysis.has_frame ->
+        output = build_complete_temporal_unit(
+          state.cached_sequence_header,
+          temporal_unit
+        )
+        buffer = build_buffer(output, pts)
+        {[buffer: {:output, buffer}], state}
+
+      # Temporal unit already has sequence header or no frame data
+      true ->
+        output = prepend_temporal_delimiter(temporal_unit)
+        buffer = build_buffer(output, pts)
+        {[buffer: {:output, buffer}], state}
+    end
+  end
+
+  defp build_buffer(payload, pts) do
+    %Buffer{
+      payload: payload,
+      pts: pts,
+      metadata: %{
+        av1: %{
+          temporal_unit_size: byte_size(payload)
+        }
+      }
+    }
+  end
+
+  # Build complete temporal unit: TD + Sequence Header + Frame Data
+  defp build_complete_temporal_unit(sequence_header, frame_data) do
+    temporal_delimiter = create_temporal_delimiter()
+    temporal_delimiter <> sequence_header <> frame_data
+  end
+
+  defp prepend_temporal_delimiter(data) do
+    create_temporal_delimiter() <> data
+  end
+
+  # Creates a canonical temporal delimiter OBU
+  # Format per AV1 spec section 5.3.1:
+  # - obu_forbidden_bit = 0 (1 bit)
+  # - obu_type = 2 (4 bits)
+  # - obu_extension_flag = 0 (1 bit)
+  # - obu_has_size_field = 1 (1 bit)
+  # - obu_reserved_1bit = 0 (1 bit)
+  # - obu_size = 0 (LEB128, 1 byte for value 0)
+  defp create_temporal_delimiter do
+    # Header byte: 0_0010_0_1_0 = 0x12
+    # Size byte: 0 (LEB128 encoding of 0)
+    <<0x12, 0x00>>
+  end
+
+  # -----------------------------------------------------------------------------
+  # State Reset
+  # -----------------------------------------------------------------------------
+
+  defp reset_depayloader(state) do
+    %{state |
+      current_temporal_unit: nil,
+      current_timestamp: nil,
+      current_obu_fragment: nil
+    }
   end
 
   # =============================================================================
   # OBU Parsing Utilities
   # =============================================================================
 
+  @doc false
   # Parse OBU header and return structured information
-  defp parse_obu_header(<<header::8, rest::binary>>) do
-    # Check if forbidden bit is 0 (valid OBU)
-    forbidden_bit = header >>> 7
-    if forbidden_bit != 0 do
-      {:error, :invalid_obu}
-    else
-      obu_type = header >>> 3 &&& 0x0F
-      has_extension = (header &&& 0x04) != 0
-      has_size = (header &&& 0x02) != 0
+  # Returns {:ok, info} or {:error, reason}
+  def parse_obu_header(<<header::8, rest::binary>>) do
+    # OBU header format (section 5.3.1):
+    # - obu_forbidden_bit (1 bit) - must be 0
+    # - obu_type (4 bits)
+    # - obu_extension_flag (1 bit)
+    # - obu_has_size_field (1 bit)
+    # - obu_reserved_1bit (1 bit)
 
-      {rest_after_ext, extension_bytes} =
+    forbidden_bit = header >>> 7
+    obu_type = (header >>> 3) &&& 0x0F
+    has_extension = (header &&& 0x04) != 0
+    has_size = (header &&& 0x02) != 0
+
+    if forbidden_bit != 0 do
+      {:error, :forbidden_bit_set}
+    else
+      # Handle extension header if present
+      {rest_after_ext, extension_bytes, extension_header} =
         if has_extension do
           case rest do
-            <<_ext::8, r::binary>> -> {r, 1}
-            _ -> {rest, 0}
+            <<ext_header::8, r::binary>> ->
+              temporal_id = (ext_header >>> 5) &&& 0x07
+              spatial_id = (ext_header >>> 3) &&& 0x03
+              {r, 1, %{temporal_id: temporal_id, spatial_id: spatial_id}}
+
+            _ ->
+              {rest, 0, nil}
           end
         else
-          {rest, 0}
+          {rest, 0, nil}
         end
 
-      {:ok,
-       %{
-         type: obu_type,
-         has_size: has_size,
-         rest: rest_after_ext,
-         header_bytes: 1 + extension_bytes
-       }}
+      {:ok, %{
+        type: obu_type,
+        has_size: has_size,
+        has_extension: has_extension,
+        extension: extension_header,
+        header_bytes: 1 + extension_bytes,
+        rest: rest_after_ext
+      }}
     end
   end
 
-  defp parse_obu_header(_), do: {:error, :invalid_obu}
+  def parse_obu_header(<<>>), do: {:error, :empty_data}
+  def parse_obu_header(_), do: {:error, :invalid_data}
 
-  # Read OBU size using LEB128 module
+  # Read OBU size using LEB128 encoding
   defp read_obu_size(data) do
     case LEB128.read(data) do
       {:ok, size_bytes, value} -> {:ok, value, size_bytes}
-      _ -> {:error, :invalid_size}
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  # Find the next OBU boundary by scanning for a valid OBU header
-  # Returns {obu_data, rest} or {data, <<>>} if no next OBU found
-  defp find_next_obu_boundary(data) do
-    find_next_obu_boundary_impl(data, 1)
-  end
+  # Get total OBU size (header + size field + payload)
+  defp get_obu_total_size(data) do
+    case parse_obu_header(data) do
+      {:ok, obu_info} ->
+        if obu_info.has_size do
+          case read_obu_size(obu_info.rest) do
+            {:ok, payload_size, size_bytes} ->
+              {:ok, obu_info.header_bytes + size_bytes + payload_size}
 
-  defp find_next_obu_boundary_impl(data, offset) when offset >= byte_size(data) do
-    {data, <<>>}
-  end
-
-  defp find_next_obu_boundary_impl(data, offset) do
-    case binary_part(data, offset, byte_size(data) - offset) do
-      <<header::8, _rest::binary>> = potential_obu ->
-        # Check if this could be a valid OBU header
-        forbidden_bit = header >>> 7
-        obu_type = header >>> 3 &&& 0x0F
-
-        # Valid OBU types are 0-15, and forbidden bit must be 0
-        if forbidden_bit == 0 and obu_type <= 15 do
-          # Found potential OBU boundary
-          {binary_part(data, 0, offset), potential_obu}
+            {:error, _} = err ->
+              err
+          end
         else
-          find_next_obu_boundary_impl(data, offset + 1)
+          # OBU without size field - special handling needed
+          get_obu_size_without_field(obu_info, data)
         end
 
-      _ ->
-        {data, <<>>}
+      {:error, _} = err ->
+        err
     end
   end
 
-  # Get the size of an OBU without a size field
-  # For RTP, we need special handling for each OBU type
-  defp get_obu_size_without_field(obu_info, data) do
+  # Handle OBUs without size field
+  # Per RTP spec: "obu_has_size_field flag SHOULD be set to zero in all OBUs"
+  # For these, we need context about what type of OBU it is
+  defp get_obu_size_without_field(obu_info, full_data) do
     case obu_info.type do
       # Temporal delimiter has no payload
       @obu_temporal_delimiter ->
-        {:ok, 0}
+        {:ok, obu_info.header_bytes}
 
-      # For other types without size field in RTP:
-      # - If this is the last OBU, it consumes the rest of the data
-      # - Otherwise, we need to find the next OBU boundary
+      # For other types, try to find next OBU boundary
+      # This is heuristic and works when OBUs are back-to-back
       _ ->
-        # Try to find next OBU
-        {obu_data, _rest} = find_next_obu_boundary(data)
-        {:ok, byte_size(obu_data) - obu_info.header_bytes}
+        case find_next_obu_boundary(full_data, obu_info.header_bytes) do
+          {:found, offset} -> {:ok, offset}
+          :not_found -> {:ok, byte_size(full_data)}
+        end
     end
   end
 
-  # Iterate through OBUs with an accumulator function
+  # Find the next OBU boundary by scanning for valid OBU headers
+  defp find_next_obu_boundary(data, start_offset) do
+    scan_for_obu_boundary(data, start_offset)
+  end
+
+  defp scan_for_obu_boundary(data, offset) when offset >= byte_size(data) do
+    :not_found
+  end
+
+  defp scan_for_obu_boundary(data, offset) do
+    <<_::binary-size(offset), rest::binary>> = data
+
+    case rest do
+      <<header::8, _::binary>> ->
+        forbidden_bit = header >>> 7
+        obu_type = (header >>> 3) &&& 0x0F
+
+        # Valid OBU: forbidden bit = 0, type in valid range
+        if forbidden_bit == 0 and obu_type in 1..8 or obu_type == 15 do
+          {:found, offset}
+        else
+          scan_for_obu_boundary(data, offset + 1)
+        end
+
+      _ ->
+        :not_found
+    end
+  end
+
+  # Iterate through OBUs in data, calling function for each
   defp iterate_obus(data, acc, fun), do: iterate_obus_impl(data, acc, fun)
 
   defp iterate_obus_impl(<<>>, acc, _fun), do: acc
 
   defp iterate_obus_impl(data, acc, fun) do
-    with {:ok, obu_info} <- parse_obu_header(data) do
-      acc = fun.(obu_info.type, acc)
+    case get_obu_total_size(data) do
+      {:ok, total_size} when total_size > 0 and total_size <= byte_size(data) ->
+        case parse_obu_header(data) do
+          {:ok, obu_info} ->
+            acc = fun.(obu_info.type, acc)
+            <<_::binary-size(total_size), rest::binary>> = data
+            iterate_obus_impl(rest, acc, fun)
 
-      # Determine how to skip to the next OBU
-      skip_result =
-        if obu_info.has_size do
-          # OBU has size field - read it with LEB128
-          case read_obu_size(obu_info.rest) do
-            {:ok, obu_size, size_bytes} ->
-              {:ok, size_bytes + obu_size}
-            _ ->
-              :error
-          end
-        else
-          # OBU doesn't have size field - need special handling
-          case get_obu_size_without_field(obu_info, obu_info.rest) do
-            {:ok, obu_payload_size} ->
-              {:ok, obu_payload_size}
-            _ ->
-              :error
-          end
+          {:error, _} ->
+            acc
         end
 
-      case skip_result do
-        {:ok, skip_bytes} ->
-          if byte_size(obu_info.rest) >= skip_bytes do
-            next_data = binary_part(obu_info.rest, skip_bytes, byte_size(obu_info.rest) - skip_bytes)
-            iterate_obus_impl(next_data, acc, fun)
-          else
-            acc
-          end
-
-        :error ->
-          acc
-      end
-    else
-      _ -> acc
+      _ ->
+        acc
     end
   end
 
-  # Strip temporal delimiter OBUs from data, keeping all other OBUs
-  defp strip_temporal_delimiters(data), do: strip_temporal_delimiters_impl(data, <<>>)
+  # Strip temporal delimiters and tile list OBUs (per RTP spec recommendations)
+  defp strip_unwanted_obus(data), do: strip_unwanted_obus_impl(data, <<>>)
 
-  defp strip_temporal_delimiters_impl(<<>>, acc), do: acc
+  defp strip_unwanted_obus_impl(<<>>, acc), do: acc
 
-  defp strip_temporal_delimiters_impl(data, acc) do
-    case parse_obu_header(data) do
-      {:ok, obu_info} ->
-        # Calculate OBU total size
-        size_result =
-          if obu_info.has_size do
-            case read_obu_size(obu_info.rest) do
-              {:ok, obu_size, size_bytes} ->
-                {:ok, obu_info.header_bytes + size_bytes + obu_size}
-              _ ->
-                :error
-            end
-          else
-            case get_obu_size_without_field(obu_info, obu_info.rest) do
-              {:ok, obu_payload_size} ->
-                {:ok, obu_info.header_bytes + obu_payload_size}
-              _ ->
-                :error
-            end
-          end
+  defp strip_unwanted_obus_impl(data, acc) do
+    case get_obu_total_size(data) do
+      {:ok, total_size} when total_size > 0 and total_size <= byte_size(data) ->
+        <<obu_data::binary-size(total_size), rest::binary>> = data
 
-        case size_result do
-          {:ok, total_size} when byte_size(data) >= total_size ->
-            obu_data = binary_part(data, 0, total_size)
-            next_data = binary_part(data, total_size, byte_size(data) - total_size)
-
-            # Skip temporal delimiters, keep everything else
+        case parse_obu_header(obu_data) do
+          {:ok, obu_info} ->
+            # Keep everything except temporal delimiters and tile lists
             new_acc =
-              if obu_info.type == @obu_temporal_delimiter do
+              if obu_info.type in [@obu_temporal_delimiter, @obu_tile_list] do
                 acc
               else
                 acc <> obu_data
               end
 
-            strip_temporal_delimiters_impl(next_data, new_acc)
+            strip_unwanted_obus_impl(rest, new_acc)
 
-          {:ok, _total_size} ->
-            # Not enough data for full OBU, keep what we have if not a TD
-            if obu_info.type == @obu_temporal_delimiter, do: acc, else: acc <> data
-
-          :error ->
-            # Can't parse, keep as-is
+          {:error, _} ->
+            # Can't parse header - keep data as-is
             acc <> data
         end
 
       _ ->
-        # Invalid OBU header, keep data as-is
+        # Can't determine size - keep remaining data as-is
         acc <> data
     end
   end
 
-  # Find OBU by type and extract it
+  # Extract sequence header OBU from data
+  defp extract_sequence_header(data), do: find_obu_by_type(data, @obu_sequence_header)
+
+  # Find and extract a specific OBU type
   defp find_obu_by_type(data, target_type), do: find_obu_by_type_impl(data, target_type)
 
-  defp find_obu_by_type_impl(<<>>, _), do: nil
+  defp find_obu_by_type_impl(<<>>, _target_type), do: nil
 
   defp find_obu_by_type_impl(data, target_type) do
-    case parse_obu_header(data) do
-      {:ok, obu_info} ->
-        if obu_info.type == target_type do
-          # Found the target OBU type
-          if obu_info.has_size do
-            # Has size field - extract using LEB128
-            case read_obu_size(obu_info.rest) do
-              {:ok, obu_size, size_bytes} ->
-                total_size = obu_info.header_bytes + size_bytes + obu_size
+    case get_obu_total_size(data) do
+      {:ok, total_size} when total_size > 0 and total_size <= byte_size(data) ->
+        <<obu_data::binary-size(total_size), rest::binary>> = data
 
-                if byte_size(data) >= total_size do
-                  binary_part(data, 0, total_size)
-                else
-                  nil
-                end
+        case parse_obu_header(obu_data) do
+          {:ok, %{type: ^target_type}} ->
+            obu_data
 
-              _ ->
-                nil
-            end
-          else
-            # No size field - extract based on OBU type or next boundary
-            case get_obu_size_without_field(obu_info, obu_info.rest) do
-              {:ok, obu_payload_size} ->
-                total_size = obu_info.header_bytes + obu_payload_size
+          {:ok, _} ->
+            find_obu_by_type_impl(rest, target_type)
 
-                if byte_size(data) >= total_size do
-                  binary_part(data, 0, total_size)
-                else
-                  # If we can't get full size, return what we have
-                  data
-                end
-
-              _ ->
-                nil
-            end
-          end
-        else
-          # Not the target type, skip to next OBU
-          skip_result =
-            if obu_info.has_size do
-              case read_obu_size(obu_info.rest) do
-                {:ok, obu_size, size_bytes} ->
-                  {:ok, size_bytes + obu_size}
-                _ ->
-                  :error
-              end
-            else
-              case get_obu_size_without_field(obu_info, obu_info.rest) do
-                {:ok, obu_payload_size} ->
-                  {:ok, obu_payload_size}
-                _ ->
-                  :error
-              end
-            end
-
-          case skip_result do
-            {:ok, skip_bytes} ->
-              if byte_size(obu_info.rest) >= skip_bytes do
-                next_data = binary_part(obu_info.rest, skip_bytes, byte_size(obu_info.rest) - skip_bytes)
-                find_obu_by_type_impl(next_data, target_type)
-              else
-                nil
-              end
-
-            :error ->
-              nil
-          end
+          {:error, _} ->
+            nil
         end
 
       _ ->
@@ -593,102 +843,60 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     end
   end
 
-  # =============================================================================
-  # Sequence Header Caching
-  # AV1 decoders need the sequence header OBU to initialize their decoding context.
-  # =============================================================================
+  # Analyze temporal unit for presence of key OBU types
+  defp analyze_temporal_unit(data) do
+    initial = %{
+      has_frame: false,
+      has_frame_header: false,
+      has_tile_group: false,
+      has_metadata: false,
+      sequence_header: nil
+    }
 
-  defp build_output_with_sequence_header(temporal_unit, pts, state) do
-    if not state.require_sequence_header do
-      # Sequence header management disabled - pass through as-is
-      buffer = %Buffer{
-        payload: temporal_unit,
-        pts: pts,
-        metadata: %{av1: %{temporal_unit_size: byte_size(temporal_unit)}}
-      }
-
-      {[buffer: {:output, buffer}], state}
-    else
-      # Sequence header management enabled
-      {has_seq_header, has_frame} = analyze_obus(temporal_unit)
-
-      # Cache sequence header if present
-      state =
-        if has_seq_header do
-          seq_header = extract_sequence_header(temporal_unit)
-
-          if seq_header != nil do
-            %{state | cached_sequence_header: seq_header, waiting_for_keyframe: false}
-          else
-            state
-          end
-        else
-          state
-        end
-
-      cond do
-        # No sequence header cached and we have frames - request keyframe
-        state.cached_sequence_header == nil and has_frame ->
-          Membrane.Logger.warning(
-            "No sequence header available, requesting keyframe. " <>
-              "AV1 decoders need sequence header to initialize."
-          )
-
-          {[event: {:output, %Membrane.KeyframeRequestEvent{}}],
-           %{state | waiting_for_keyframe: true}}
-
-        # Have cached sequence header but payload doesn't have one - prepend it
-        state.cached_sequence_header != nil and not has_seq_header and has_frame ->
-          # Output: temporal_delimiter + cached_sequence_header + rest of temporal_unit
-          # The temporal_unit already has temporal delimiter prepended in do_depayload,
-          # so we insert the sequence header after the temporal delimiter
-          complete_payload = insert_sequence_header_after_delimiter(
-            temporal_unit,
-            state.cached_sequence_header
-          )
-
-          buffer = %Buffer{
-            payload: complete_payload,
-            pts: pts,
-            metadata: %{av1: %{temporal_unit_size: byte_size(complete_payload)}}
-          }
-
-          {[buffer: {:output, buffer}], state}
-
-        # Normal case - has sequence header or is not a frame
-        true ->
-          buffer = %Buffer{
-            payload: temporal_unit,
-            pts: pts,
-            metadata: %{av1: %{temporal_unit_size: byte_size(temporal_unit)}}
-          }
-
-          {[buffer: {:output, buffer}], state}
-      end
-    end
-  end
-
-  # Insert sequence header after the temporal delimiter (first 2 bytes)
-  defp insert_sequence_header_after_delimiter(temporal_unit, sequence_header) do
-    # Temporal delimiter is 2 bytes: <<0x12, 0x00>>
-    <<delimiter::binary-size(2), rest::binary>> = temporal_unit
-    delimiter <> sequence_header <> rest
-  end
-
-  # Analyze OBUs in data to check for presence of sequence header and frame OBUs
-  defp analyze_obus(data) do
-    iterate_obus(data, {false, false}, fn obu_type, {has_seq, has_frame} ->
+    iterate_obus_with_data(data, initial, fn obu_type, obu_data, acc ->
       case obu_type do
-        @obu_sequence_header -> {true, has_frame}
-        @obu_frame -> {has_seq, true}
-        _ -> {has_seq, has_frame}
+        @obu_sequence_header ->
+          %{acc | sequence_header: obu_data}
+
+        @obu_frame ->
+          %{acc | has_frame: true}
+
+        @obu_frame_header ->
+          %{acc | has_frame_header: true}
+
+        @obu_tile_group ->
+          %{acc | has_tile_group: true}
+
+        @obu_metadata ->
+          %{acc | has_metadata: true}
+
+        _ ->
+          acc
       end
     end)
   end
 
-  # Extract the sequence header OBU from data
-  defp extract_sequence_header(data) do
-    find_obu_by_type(data, @obu_sequence_header)
-  end
+  # Like iterate_obus but passes both type and full OBU data to callback
+  defp iterate_obus_with_data(data, acc, fun), do: iterate_obus_with_data_impl(data, acc, fun)
 
+  defp iterate_obus_with_data_impl(<<>>, acc, _fun), do: acc
+
+  defp iterate_obus_with_data_impl(data, acc, fun) do
+    case get_obu_total_size(data) do
+      {:ok, total_size} when total_size > 0 and total_size <= byte_size(data) ->
+        <<obu_data::binary-size(total_size), rest::binary>> = data
+
+        case parse_obu_header(obu_data) do
+          {:ok, obu_info} ->
+            acc = fun.(obu_info.type, obu_data, acc)
+            iterate_obus_with_data_impl(rest, acc, fun)
+
+          {:error, _} ->
+            acc
+        end
+
+      _ ->
+        acc
+    end
+  end
 end
