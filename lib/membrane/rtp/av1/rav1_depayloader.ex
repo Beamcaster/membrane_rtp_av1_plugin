@@ -202,23 +202,19 @@ defmodule Membrane.RTP.AV1.Rav1Depayloader do
   defp decode_draft_header(payload) do
     case Header.decode(payload) do
       {:ok, header, rest} ->
-        # Map draft header to common format
-        w =
-          cond do
-            not header.fragmented? -> 0
-            header.start? and header.end? -> 0
-            header.start? -> 1
-            header.end? -> 3
-            true -> 2
-          end
+        # Map spec header Z/Y to common format
+        # z=1 means continuation (NOT start), y=1 means continues (NOT end)
+        start? = not header.z
+        end? = not header.y
+        fragmented? = header.z or header.y
 
         header_info = %{
-          w: w,
-          fragmented?: header.fragmented?,
-          start?: header.start?,
-          end?: header.end?,
-          y: nil,
-          n: nil,
+          w: header.w,
+          fragmented?: fragmented?,
+          start?: start?,
+          end?: end?,
+          y: header.y,
+          n: header.n,
           temporal_id: nil,
           spatial_id: nil
         }

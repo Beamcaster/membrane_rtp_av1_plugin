@@ -350,9 +350,9 @@ defmodule Membrane.RTP.AV1.Rav1DepayloaderTest do
         cached_scalability_structure: nil
       }
 
-      # Create draft mode header (S=0, E=0, F=0, C=1)
-      # Binary: 0000_0001 = 0x01
-      header = %Header{start?: false, end?: false, fragmented?: false, obu_count: 1}
+      # Create spec header: complete packet with 1 OBU (Z=0, Y=0, W=1, N=0)
+      # Binary: 0001_0000 = 0x10
+      header = %Header{z: false, y: false, w: 1, n: false}
       payload = Header.encode(header) <> <<0x05, 0x01, 0x02, 0x03, 0x04>>
 
       buffer = %Buffer{

@@ -188,7 +188,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   defp log_packet_debug(state, av1_payload, timestamp, marker) do
     obu_types = list_obu_types(av1_payload.payload)
 
-    Membrane.Logger.info("""
+    Membrane.Logger.debug("""
     RTP packet received:
     - Timestamp: #{timestamp}
     - Marker: #{marker}

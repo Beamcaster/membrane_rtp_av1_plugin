@@ -22,7 +22,8 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     OBUHeader,
     OBUValidator,
     TUDetector,
-    AggregationOptimizer
+    AggregationOptimizer,
+    SequenceDetector
   }
 
   @doc """
@@ -31,33 +32,45 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
 
   Each RTP payload starts with a 1-byte header encoded via `Membrane.RTP.AV1.Header`.
 
-  Validates OBU structure before packetization and emits telemetry events
-  for malformed OBUs.
+  ## Options
+  - :mtu - Maximum transmission unit (default: 1200)
+  - :header_mode - Header encoding mode (default: :draft)
+  - :fmtp - Format parameters map
+  - :validate - Enable OBU validation before fragmentation (default: false).
+    When false, skips validation for better performance. Useful for payloading
+    trusted encoder output. When true, validates structure and emits warnings
+    for malformed OBUs.
   """
   @spec fragment(payload(), keyword()) :: [payload()] | {:error, atom(), map()}
   def fragment(access_unit, opts \\ []) when is_binary(access_unit) do
     mtu = Keyword.get(opts, :mtu, @default_mtu)
-    header_mode = Keyword.get(opts, :header_mode, :draft)
+    header_mode = Keyword.get(opts, :header_mode, :spec)
+    validate = Keyword.get(opts, :validate, false)
     # Use parse_legacy for backward compatibility (returns struct directly, nils on errors)
     fmtp = FMTP.parse_legacy(Keyword.get(opts, :fmtp, %{}))
     max_payload = mtu - @header_size
 
-    # Validate OBU boundaries before processing
-    case OBUValidator.validate_access_unit(access_unit) do
-      :ok ->
-        fragment_validated(access_unit, max_payload, header_mode, fmtp)
+    if validate do
+      # Validate OBU boundaries before processing
+      case OBUValidator.validate_access_unit(access_unit) do
+        :ok ->
+          fragment_validated(access_unit, max_payload, header_mode, fmtp)
 
-      {:error, reason, context} = error ->
-        # Log validation error
-        require Membrane.Logger
+        {:error, reason, context} = error ->
+          # Log validation error
+          require Membrane.Logger
 
-        Membrane.Logger.warning(
-          "OBU validation failed: #{OBUValidator.error_message(error)}. " <>
-            "Attempting fallback fragmentation."
-        )
+          Membrane.Logger.warning(
+            "OBU validation failed: #{OBUValidator.error_message(error)}. " <>
+              "Attempting fallback fragmentation."
+          )
 
-        # Attempt fallback fragmentation for backwards compatibility
-        fallback_fragment(access_unit, max_payload, header_mode, fmtp, reason, context)
+          # Attempt fallback fragmentation for backwards compatibility
+          fallback_fragment(access_unit, max_payload, header_mode, fmtp, reason, context)
+      end
+    else
+      # Skip validation - trust the input and fragment directly
+      fragment_validated(access_unit, max_payload, header_mode, fmtp)
     end
   end
 
@@ -71,12 +84,14 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
   - :header_mode - Header encoding mode (default: :draft)
   - :fmtp - Format parameters map
   - :tu_aware - Enable TU detection for marker bits (default: true)
+  - :validate - Enable OBU validation before fragmentation (default: false)
   """
   @spec fragment_with_markers(payload(), keyword()) ::
           [{payload(), boolean()}] | {:error, atom(), map()}
   def fragment_with_markers(access_unit, opts \\ []) when is_binary(access_unit) do
     tu_aware = Keyword.get(opts, :tu_aware, true)
 
+    # Pass all options (including validate) to fragment/2
     case fragment(access_unit, opts) do
       {:error, _, _} = error ->
         error
@@ -95,15 +110,19 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
   end
 
   defp fragment_validated(access_unit, max_payload, header_mode, fmtp) do
+    # Detect if this access unit contains a sequence header (OBU type 1)
+    # If present, the first RTP packet must have N=1 bit set
+    has_sequence_header = SequenceDetector.contains_sequence_header?(access_unit)
+
     obus = OBU.split_obus(access_unit)
 
     case obus do
       [^access_unit] ->
         # Could not parse into OBUs; fallback to naive fragmentation with headers
-        naive_fragment(access_unit, max_payload, header_mode, fmtp)
+        naive_fragment(access_unit, max_payload, header_mode, fmtp, has_sequence_header)
 
       list ->
-        fragment_obus(list, max_payload, header_mode, fmtp)
+        fragment_obus(list, max_payload, header_mode, fmtp, has_sequence_header)
     end
     # Zero-copy: Convert IO lists to binaries only at the final step
     |> Enum.map(&IO.iodata_to_binary/1)
@@ -122,15 +141,17 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
 
       _ ->
         # Other errors: try naive fragmentation as best effort
+        # Detect sequence header even in fallback case
+        has_sequence_header = SequenceDetector.contains_sequence_header?(access_unit)
         # Zero-copy: Convert IO lists to binaries at the final step
-        naive_fragment(access_unit, max_payload, header_mode, fmtp)
+        naive_fragment(access_unit, max_payload, header_mode, fmtp, has_sequence_header)
         |> Enum.map(&IO.iodata_to_binary/1)
     end
   end
 
-  defp fragment_obus(obus, max_payload, header_mode, fmtp) do
+  defp fragment_obus(obus, max_payload, header_mode, fmtp, has_sequence_header) do
     packets =
-      do_fragment_obus(obus, max_payload, {[], 0, []}, [], header_mode, fmtp)
+      do_fragment_obus(obus, max_payload, {[], 0, []}, [], header_mode, fmtp, has_sequence_header)
       |> Enum.reverse()
 
     # Emit telemetry for aggregation metrics
@@ -163,20 +184,38 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
   # fragment it across packets.
   # State tuple: {group_iolist, count, obus_in_group}
   # Zero-copy: Use IO lists for accumulation instead of binary concatenation
+  # is_first_packet: true for first packet (may set N=1), false for subsequent packets
+
+  # Function head with default parameter
+  defp do_fragment_obus(
+         obus,
+         max_payload,
+         state,
+         acc,
+         header_mode,
+         fmtp,
+         has_sequence_header,
+         is_first_packet \\ true
+       )
+
   defp do_fragment_obus(
          [],
          _max_payload,
          {group_iolist, count, obus_in_group},
          acc,
          header_mode,
-         fmtp
+         fmtp,
+         has_sequence_header,
+         is_first_packet
        ) do
     if count == 0 do
       acc
     else
       # Flatten IO list only when creating final packet
       payload = IO.iodata_to_binary(group_iolist)
-      header = encode_header(false, true, false, count, obus_in_group, header_mode, fmtp)
+      # N bit: set only on first packet if sequence header present
+      n_bit = has_sequence_header and is_first_packet
+      header = encode_header(false, true, false, count, obus_in_group, header_mode, fmtp, n_bit)
       pkt = [header | payload]
       [pkt | acc]
     end
@@ -188,7 +227,9 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
          {group_iolist, count, obus_in_group},
          acc,
          header_mode,
-         fmtp
+         fmtp,
+         has_sequence_header,
+         is_first_packet
        ) do
     # Calculate current group size by flattening IO list
     group_payload_size = IO.iodata_length(group_iolist)
@@ -208,28 +249,83 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
           {new_group, count + 1, [obu | obus_in_group]},
           acc,
           header_mode,
-          fmtp
+          fmtp,
+          has_sequence_header,
+          is_first_packet
         )
 
       group_payload_size > 0 and count > 0 ->
         # Flush current group, then reconsider this OBU
         payload = IO.iodata_to_binary(group_iolist)
-        header = encode_header(false, true, false, count, obus_in_group, header_mode, fmtp)
+        # N bit: set only on first packet if sequence header present
+        n_bit = has_sequence_header and is_first_packet
+        header = encode_header(false, true, false, count, obus_in_group, header_mode, fmtp, n_bit)
         pkt = [header | payload]
         acc = [pkt | acc]
-        do_fragment_obus([obu | rest], max_payload, {[], 0, []}, acc, header_mode, fmtp)
+        # After first packet, set is_first_packet to false
+        do_fragment_obus(
+          [obu | rest],
+          max_payload,
+          {[], 0, []},
+          acc,
+          header_mode,
+          fmtp,
+          has_sequence_header,
+          false
+        )
 
       true ->
         # Fragment this single OBU
-        acc = fragment_single_obu(obu, max_payload, acc, header_mode, fmtp)
-        do_fragment_obus(rest, max_payload, {[], 0, []}, acc, header_mode, fmtp)
+        acc =
+          fragment_single_obu(
+            obu,
+            max_payload,
+            acc,
+            header_mode,
+            fmtp,
+            has_sequence_header,
+            is_first_packet
+          )
+
+        # After fragmenting (which creates packets), subsequent packets have is_first_packet = false
+        do_fragment_obus(
+          rest,
+          max_payload,
+          {[], 0, []},
+          acc,
+          header_mode,
+          fmtp,
+          has_sequence_header,
+          false
+        )
     end
   end
 
-  defp fragment_single_obu(obu, max_payload, acc, header_mode, fmtp) do
+  defp fragment_single_obu(
+         obu,
+         max_payload,
+         acc,
+         header_mode,
+         fmtp,
+         has_sequence_header,
+         is_first_packet
+       ) do
     total = byte_size(obu)
     # Zero-copy: Use binary references instead of splitting
-    packets = build_fragment_packets(0, total, obu, max_payload, [], true, header_mode, fmtp)
+    packets =
+      build_fragment_packets(
+        0,
+        total,
+        obu,
+        max_payload,
+        [],
+        true,
+        header_mode,
+        fmtp,
+        has_sequence_header,
+        is_first_packet
+      )
+
     Enum.reduce(packets, acc, fn pkt, a -> [pkt | a] end)
   end
 
@@ -242,7 +338,9 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
          acc,
          start?,
          header_mode,
-         fmtp
+         fmtp,
+         has_sequence_header,
+         is_first_packet
        ) do
     remaining = total_size - offset
     chunk_size = min(max_payload, remaining)
@@ -251,8 +349,12 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     # Zero-copy: Use binary_part to reference bytes without copying
     chunk = :binary.part(original_obu, offset, chunk_size)
 
+    # N bit: set only on first fragment if this is the first packet and has sequence header
+    # start? indicates if this is the first fragment of this OBU
+    n_bit = has_sequence_header and is_first_packet and start?
+
     # Zero-copy: Build packet as IO list [header | chunk] instead of binary concatenation
-    header = encode_header(start?, is_last?, true, 0, [original_obu], header_mode, fmtp)
+    header = encode_header(start?, is_last?, true, 0, [original_obu], header_mode, fmtp, n_bit)
     packet = [header | chunk]
     acc = [packet | acc]
 
@@ -267,22 +369,55 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
         acc,
         false,
         header_mode,
-        fmtp
+        fmtp,
+        has_sequence_header,
+        # After first fragment, no longer first packet
+        false
       )
     end
   end
 
-  defp naive_fragment(binary, max_payload, header_mode, fmtp) do
-    do_naive_fragment(binary, 0, byte_size(binary), max_payload, [], true, header_mode, fmtp)
+  defp naive_fragment(binary, max_payload, header_mode, fmtp, has_sequence_header) do
+    do_naive_fragment(
+      binary,
+      0,
+      byte_size(binary),
+      max_payload,
+      [],
+      true,
+      header_mode,
+      fmtp,
+      has_sequence_header
+    )
   end
 
   # Zero-copy: Use offset-based approach instead of binary splitting
-  defp do_naive_fragment(_bin, offset, total_size, _max, acc, _is_first, _header_mode, _fmtp)
+  defp do_naive_fragment(
+         _bin,
+         offset,
+         total_size,
+         _max,
+         acc,
+         _is_first,
+         _header_mode,
+         _fmtp,
+         _has_sequence_header
+       )
        when offset >= total_size do
     Enum.reverse(acc)
   end
 
-  defp do_naive_fragment(bin, offset, total_size, max, acc, is_first, header_mode, fmtp) do
+  defp do_naive_fragment(
+         bin,
+         offset,
+         total_size,
+         max,
+         acc,
+         is_first,
+         header_mode,
+         fmtp,
+         has_sequence_header
+       ) do
     remaining = total_size - offset
     chunk_size = min(max, remaining)
     is_last? = chunk_size >= remaining
@@ -290,9 +425,12 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     # Zero-copy: Use binary_part to reference bytes
     chunk = :binary.part(bin, offset, chunk_size)
 
+    # N bit: set only on first packet if sequence header present
+    n_bit = has_sequence_header and is_first
+
     # Build packet as IO list
     # fragmented? = true because we're fragmenting (multiple packets)
-    header = encode_header(is_first, is_last?, true, 0, [], header_mode, fmtp)
+    header = encode_header(is_first, is_last?, true, 0, [], header_mode, fmtp, n_bit)
     pkt = [header | chunk]
 
     do_naive_fragment(
@@ -303,16 +441,27 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
       [pkt | acc],
       false,
       header_mode,
-      fmtp
+      fmtp,
+      has_sequence_header
     )
   end
 
-  defp encode_header(start?, end?, fragmented?, obu_count, _obus, :draft, _fmtp) do
-    header = %Header{start?: start?, end?: end?, fragmented?: fragmented?, obu_count: obu_count}
+  defp encode_header(start?, end?, fragmented?, obu_count, _obus, :draft, _fmtp, n_bit) do
+    # Map to spec-compliant Z/Y/W/N format
+    # Z = not start? (continuation from previous)
+    # Y = not end? (continues in next)
+    # W = min(obu_count, 3) or 0 for length-prefixed
+    # N = n_bit (new coded video sequence)
+
+    z = not start? and fragmented?
+    y = not end? and fragmented?
+    w = if fragmented? or obu_count == 0, do: 0, else: min(obu_count, 3)
+
+    header = %Header{z: z, y: y, w: w, n: n_bit}
     Header.encode(header)
   end
 
-  defp encode_header(start?, end?, fragmented?, obu_count, obus, :spec, fmtp) do
+  defp encode_header(start?, end?, fragmented?, obu_count, obus, :spec, fmtp, n_bit) do
     w =
       cond do
         not fragmented? -> 0
@@ -351,7 +500,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
       z: z,
       y: start?,
       w: w,
-      n: false,
+      n: n_bit,
       c: c,
       m: m,
       temporal_id: tid,

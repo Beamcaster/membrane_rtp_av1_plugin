@@ -72,9 +72,7 @@ defmodule Membrane.RTP.AV1.Payloader do
   end
 
   @impl true
-  def handle_stream_format(:input, stream_format, _ctx, state) do
-    dbg(stream_format)
-
+  def handle_stream_format(:input, _stream_format, _ctx, state) do
     stream_format = %Membrane.RTP{
       # clock_rate: 90_000
     }

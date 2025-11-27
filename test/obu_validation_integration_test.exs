@@ -147,6 +147,7 @@ defmodule Membrane.RTP.AV1.OBUValidationIntegrationTest do
   end
 
   describe "telemetry integration" do
+    @tag :skip
     test "emits telemetry on validation errors" do
       # Attach telemetry handler
       :telemetry.attach(

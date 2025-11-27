@@ -1,45 +1,49 @@
 defmodule Membrane.RTP.AV1.Header do
   @moduledoc """
-  Minimal AV1 RTP payload header (non-spec, draft-aligned concept):
+  AV1 RTP payload aggregation header per RTP Payload Format for AV1 v1.0.0
 
-  Uses 1 byte:
-  - S: start of OBU fragment group (1 bit)
-  - E: end of OBU fragment group (1 bit)
-  - F: packet carries fragmented OBU data (1 bit)
-  - C: number of complete OBUs aggregated in this packet (5 bits)
+  Format:
+      0 1 2 3 4 5 6 7
+      +-+-+-+-+-+-+-+-+
+      |Z|Y| W |N|-|-|-|
+      +-+-+-+-+-+-+-+-+
 
-  This aims to be forward-compatible with spec ideas (start/end markers and aggregation count),
-  but is intentionally simplified for initial implementation.
+  - Z: First OBU is continuation of previous packet's fragment
+  - Y: Last OBU will continue in next packet
+  - W: Number of OBU elements (0=use length fields, 1-3=count)
+  - N: First packet of coded video sequence (keyframe with sequence header)
+  - Bits 2-0: Reserved (must be 0)
   """
   import Bitwise
 
   @type t :: %__MODULE__{
-          start?: boolean(),
-          end?: boolean(),
-          fragmented?: boolean(),
-          obu_count: 0..31
+          z: boolean(),
+          y: boolean(),
+          w: 0..3,
+          n: boolean()
         }
-  defstruct start?: false, end?: false, fragmented?: false, obu_count: 0
+
+  defstruct z: false, y: false, w: 0, n: false
 
   @spec encode(t()) :: binary()
-  def encode(%__MODULE__{start?: s, end?: e, fragmented?: f, obu_count: c})
-      when is_boolean(s) and is_boolean(e) and is_boolean(f) and c in 0..31 do
-    sbit = if s, do: 1, else: 0
-    ebit = if e, do: 1, else: 0
-    fbit = if f, do: 1, else: 0
-    <<(sbit <<< 7) ||| (ebit <<< 6) ||| (fbit <<< 5) ||| c>>
+  def encode(%__MODULE__{z: z, y: y, w: w, n: n})
+      when is_boolean(z) and is_boolean(y) and w in 0..3 and is_boolean(n) do
+    z_bit = if z, do: 1, else: 0
+    y_bit = if y, do: 1, else: 0
+    n_bit = if n, do: 1, else: 0
+
+    <<z_bit <<< 7 ||| y_bit <<< 6 ||| w <<< 4 ||| n_bit <<< 3>>
   end
 
   @spec decode(binary()) :: {:ok, t(), binary()} | :error
   def decode(<<byte, rest::binary>>) do
-    s = (byte &&& 0b1000_0000) != 0
-    e = (byte &&& 0b0100_0000) != 0
-    f = (byte &&& 0b0010_0000) != 0
-    c = byte &&& 0b0001_1111
-    {:ok, %__MODULE__{start?: s, end?: e, fragmented?: f, obu_count: c}, rest}
+    z = (byte &&& 0b1000_0000) != 0
+    y = (byte &&& 0b0100_0000) != 0
+    w = byte >>> 4 &&& 0b11
+    n = (byte &&& 0b0000_1000) != 0
+
+    {:ok, %__MODULE__{z: z, y: y, w: w, n: n}, rest}
   end
 
   def decode(_), do: :error
-
-  import Bitwise
 end
