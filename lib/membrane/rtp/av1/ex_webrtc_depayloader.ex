@@ -93,6 +93,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     @type t :: %__MODULE__{
             current_temporal_unit: binary() | nil,
             current_timestamp: non_neg_integer() | nil,
+            current_pts: Membrane.Time.t() | nil,
             current_obu_fragment: binary() | nil,
             max_reorder_buffer: pos_integer(),
             require_sequence_header: boolean(),
@@ -110,6 +111,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       current_temporal_unit: nil,
       # RTP timestamp of current temporal unit
       current_timestamp: nil,
+      # PTS of first packet in current temporal unit
+      current_pts: nil,
       # OBU fragment being assembled across packets (Z/Y fragmentation)
       current_obu_fragment: nil,
       # Configuration
@@ -232,10 +235,11 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     # Z=0,Y=1: First fragment
     # Z=1,Y=0: Last fragment
     # Z=1,Y=1: Middle fragment
-    state = handle_obu_fragments(state, av1_payload, timestamp)
+    state = handle_obu_fragments(state, av1_payload, timestamp, pts)
 
     # Step 3: Check if we have a complete temporal unit (marker bit set)
-    maybe_emit_temporal_unit(state, marker, pts)
+    # Note: we use state.current_pts (captured from first packet) not the passed pts
+    maybe_emit_temporal_unit(state, marker)
   end
 
   # -----------------------------------------------------------------------------
@@ -247,13 +251,13 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     # Per spec: "MUST be set to 1 if the packet is the first packet of a coded video sequence"
     # A sequence header SHOULD be present in this temporal unit
 
-    Membrane.Logger.info("N=1: New coded video sequence starting at timestamp #{timestamp}")
+    Membrane.Logger.debug("N=1: New coded video sequence starting at timestamp #{timestamp}")
 
     case extract_sequence_header(av1_payload.payload) do
       nil ->
         # Sequence header not in this packet - might be in next packet of same TU
         # Or encoder might be sending it separately (less common)
-        Membrane.Logger.info(
+        Membrane.Logger.debug(
           "N=1 packet without sequence header - may arrive in subsequent packet"
         )
 
@@ -270,7 +274,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     cond do
       # First sequence header ever
       state.cached_sequence_header == nil ->
-        Membrane.Logger.info("""
+        Membrane.Logger.debug("""
         Initial sequence header received and cached
         - Size: #{byte_size(new_seq_header)} bytes
         - Timestamp: #{timestamp}
@@ -287,7 +291,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
       # Sequence header changed (resolution change, profile change, etc.)
       new_seq_header != state.cached_sequence_header ->
-        Membrane.Logger.info("""
+        Membrane.Logger.debug("""
         Sequence header CHANGED - new coded video sequence
         - Previous size: #{byte_size(state.cached_sequence_header)} bytes
         - New size: #{byte_size(new_seq_header)} bytes
@@ -307,7 +311,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
       # Same sequence header (common case - keyframe with same params)
       true ->
-        Membrane.Logger.info("Sequence header unchanged (generation #{state.sequence_header_generation})")
+        Membrane.Logger.debug("Sequence header unchanged (generation #{state.sequence_header_generation})")
 
         %{state |
           waiting_for_keyframe: false,
@@ -322,35 +326,35 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # OBU Fragment Handling (Z/Y Bits)
   # -----------------------------------------------------------------------------
 
-  defp handle_obu_fragments(state, av1_payload, timestamp) do
+  defp handle_obu_fragments(state, av1_payload, timestamp, pts) do
     case {av1_payload.z, av1_payload.y, state.current_obu_fragment} do
       # Z=0, Y=0: Single complete OBU (or multiple complete OBUs)
       {0, 0, nil} ->
-        append_obus(state, timestamp, av1_payload.payload)
+        append_obus(state, timestamp, av1_payload.payload, pts)
 
       # Z=0, Y=0: Complete OBU but we have leftover fragment (packet loss case)
       {0, 0, _fragment} ->
-        Membrane.Logger.info(
+        Membrane.Logger.debug(
           "Received complete OBU while having incomplete fragment - dropping fragment (likely packet loss)"
         )
 
         state
         |> reset_obu_fragment()
-        |> append_obus(timestamp, av1_payload.payload)
+        |> append_obus(timestamp, av1_payload.payload, pts)
 
       # Z=0, Y=1: First fragment of an OBU
       {0, 1, nil} ->
-        start_obu_fragment(state, timestamp, av1_payload.payload)
+        start_obu_fragment(state, timestamp, av1_payload.payload, pts)
 
       # Z=0, Y=1: First fragment but we already have one (packet loss case)
       {0, 1, _fragment} ->
-        Membrane.Logger.info(
+        Membrane.Logger.debug(
           "Received first OBU fragment while having incomplete fragment - dropping old fragment"
         )
 
         state
         |> reset_obu_fragment()
-        |> start_obu_fragment(timestamp, av1_payload.payload)
+        |> start_obu_fragment(timestamp, av1_payload.payload, pts)
 
       # Z=1, Y=0: Last fragment of an OBU
       {1, 0, fragment} when fragment != nil and timestamp == state.current_timestamp ->
@@ -358,11 +362,12 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
         state
         |> reset_obu_fragment()
-        |> append_obus(timestamp, complete_obu)
+        # Use existing current_pts since this is a continuation (not first packet)
+        |> append_obus(timestamp, complete_obu, state.current_pts)
 
       # Z=1, Y=0: Last fragment but no matching first fragment
       {1, 0, _} ->
-        Membrane.Logger.info(
+        Membrane.Logger.warning(
           "Received last OBU fragment without matching first fragment - dropping"
         )
 
@@ -374,7 +379,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
       # Z=1, Y=1: Middle fragment but no matching first fragment
       {1, 1, _} ->
-        Membrane.Logger.info(
+        Membrane.Logger.debug(
           "Received middle OBU fragment without matching first fragment - dropping"
         )
 
@@ -382,17 +387,21 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     end
   end
 
-  defp start_obu_fragment(state, timestamp, fragment) do
+  defp start_obu_fragment(state, timestamp, fragment, pts) do
     if state.current_temporal_unit != nil and timestamp != state.current_timestamp do
-      Membrane.Logger.info("""
+      Membrane.Logger.debug("""
       Starting OBU fragment with different timestamp - dropping incomplete temporal unit
       Old timestamp: #{state.current_timestamp}, New timestamp: #{timestamp}
       """)
     end
 
+    # When starting a new temporal unit (different timestamp), capture PTS
+    new_pts = if timestamp != state.current_timestamp, do: pts, else: state.current_pts
+
     %{state |
       current_obu_fragment: fragment,
       current_timestamp: timestamp,
+      current_pts: new_pts,
       current_temporal_unit:
         if(timestamp != state.current_timestamp, do: nil, else: state.current_temporal_unit)
     }
@@ -406,7 +415,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # OBU Accumulation
   # -----------------------------------------------------------------------------
 
-  defp append_obus(state, timestamp, obu_data) do
+  defp append_obus(state, timestamp, obu_data, pts) do
     # Strip temporal delimiters - we add a canonical one at output
     # Also strip tile list OBUs per spec: "SHOULD be removed when transmitted"
     filtered_data = strip_unwanted_obus(obu_data)
@@ -418,21 +427,29 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       state = maybe_cache_sequence_header_opportunistic(state, filtered_data, timestamp)
 
       cond do
-        # Starting new temporal unit
+        # Starting new temporal unit - capture PTS from first packet
         state.current_temporal_unit == nil ->
-          %{state | current_temporal_unit: filtered_data, current_timestamp: timestamp}
+          %{state |
+            current_temporal_unit: filtered_data,
+            current_timestamp: timestamp,
+            current_pts: pts
+          }
 
         # Different timestamp - new temporal unit (previous one incomplete)
         timestamp != state.current_timestamp ->
-          Membrane.Logger.info("""
+          Membrane.Logger.warning("""
           Received OBU with different timestamp without finishing previous temporal unit
           Old timestamp: #{state.current_timestamp}, New timestamp: #{timestamp}
           Dropping incomplete temporal unit
           """)
 
-          %{state | current_temporal_unit: filtered_data, current_timestamp: timestamp}
+          %{state |
+            current_temporal_unit: filtered_data,
+            current_timestamp: timestamp,
+            current_pts: pts
+          }
 
-        # Same timestamp - append to current temporal unit
+        # Same timestamp - append to current temporal unit (keep existing PTS)
         true ->
           %{state | current_temporal_unit: state.current_temporal_unit <> filtered_data}
       end
@@ -449,12 +466,12 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
         seq_header when state.waiting_for_sequence_header ->
           # We were expecting this after N=1
-          Membrane.Logger.info("Found sequence header after N=1 (in subsequent packet)")
+          Membrane.Logger.debug("Found sequence header after N=1 (in subsequent packet)")
           handle_sequence_header_received(state, seq_header, timestamp)
 
         seq_header when state.cached_sequence_header == nil ->
           # First sequence header (even without N=1)
-          Membrane.Logger.info("Found sequence header without N=1 - caching opportunistically")
+          Membrane.Logger.debug("Found sequence header without N=1 - caching opportunistically")
           handle_sequence_header_received(state, seq_header, timestamp)
 
         seq_header when seq_header != state.cached_sequence_header ->
@@ -478,14 +495,15 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # Temporal Unit Emission
   # -----------------------------------------------------------------------------
 
-  defp maybe_emit_temporal_unit(state, marker, pts) do
+  defp maybe_emit_temporal_unit(state, marker) do
     case {state.current_temporal_unit, marker} do
       {nil, _} ->
         {[], state}
 
       {temporal_unit, true} ->
         # Marker bit set - temporal unit is complete
-        emit_temporal_unit(state, temporal_unit, pts)
+        # Use state.current_pts which was captured from the first packet of this temporal unit
+        emit_temporal_unit(state, temporal_unit, state.current_pts)
 
       {_temporal_unit, false} ->
         # More packets expected for this temporal unit
@@ -623,6 +641,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     %{state |
       current_temporal_unit: nil,
       current_timestamp: nil,
+      current_pts: nil,
       current_obu_fragment: nil
     }
   end
