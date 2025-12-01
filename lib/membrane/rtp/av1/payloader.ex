@@ -25,7 +25,7 @@ defmodule Membrane.RTP.AV1.Payloader do
   def_options(
     mtu: [
       spec: pos_integer(),
-      default: 1200,
+      default: 4500,
       description:
         "Maximum RTP payload size in bytes. Default: 1200 (safe), Max: 9000 (jumbo frames). Can be changed dynamically via MTUUpdateEvent."
     ],
@@ -46,7 +46,7 @@ defmodule Membrane.RTP.AV1.Payloader do
     ],
     header_mode: [
       spec: atom(),
-      default: :draft,
+      default: :spec,
       description: "Header encoding mode for AV1 RTP payloads"
     ]
   )
@@ -106,10 +106,11 @@ defmodule Membrane.RTP.AV1.Payloader do
   end
 
   @impl true
-  def handle_buffer(:input, %Buffer{payload: access_unit, pts: pts} = buffer, _ctx, state) do
-    header_mode = Map.get(state, :header_mode, :draft)
+  def handle_buffer(:input, %Buffer{payload: access_unit, pts: pts} = _buffer, _ctx, state) do
+    header_mode = Map.get(state, :header_mode, :spec)
 
     # Use TU-aware fragmentation for proper marker bit placement
+    # PayloadFormat accepts Low Overhead format directly (obu_has_size_field=1)
     result =
       PayloadFormat.fragment_with_markers(access_unit,
         mtu: state.mtu,
@@ -132,7 +133,6 @@ defmodule Membrane.RTP.AV1.Payloader do
         packets_with_markers when is_list(packets_with_markers) ->
           packets_with_markers
           |> Enum.map(fn {payload, marker} ->
-            # PayloadFormat.fragment_with_markers returns binaries (IO lists flattened internally)
             metadata = %{rtp: %{marker: marker}}
             buffer = %Buffer{payload: payload, pts: pts, metadata: metadata}
             {:buffer, {:output, buffer}}
@@ -144,7 +144,6 @@ defmodule Membrane.RTP.AV1.Payloader do
 
   # Private helpers
 
-  @doc false
   @spec validate_mtu(pos_integer()) :: pos_integer()
   defp validate_mtu(mtu) when mtu < @min_mtu, do: @min_mtu
   defp validate_mtu(mtu) when mtu > @max_mtu, do: @max_mtu

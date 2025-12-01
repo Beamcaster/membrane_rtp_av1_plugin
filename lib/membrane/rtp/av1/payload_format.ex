@@ -114,7 +114,17 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     # If present, the first RTP packet must have N=1 bit set
     has_sequence_header = SequenceDetector.contains_sequence_header?(access_unit)
 
-    obus = OBU.split_obus(access_unit)
+    # Try to split OBUs - first Low Overhead format (from depayloader),
+    # then Annex B format (for backwards compatibility with tests/legacy)
+    obus =
+      case OBU.split_obus_low_overhead(access_unit) do
+        [^access_unit] ->
+          # Low Overhead parsing failed, try Annex B format
+          OBU.split_obus(access_unit)
+
+        low_overhead_obus ->
+          low_overhead_obus
+      end
 
     case obus do
       [^access_unit] ->

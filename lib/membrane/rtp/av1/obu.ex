@@ -28,6 +28,93 @@ defmodule Membrane.RTP.AV1.OBU do
   end
 
   @doc """
+  Splits a Low Overhead Bitstream Format access unit into OBUs.
+
+  Each OBU has `obu_has_size_field=1` with size embedded in the OBU header itself,
+  rather than external LEB128 length prefixes.
+
+  This is the format output by depayloaders for temporal units.
+
+  If parsing fails at any point, returns a single-element list containing the original binary.
+  """
+  @spec split_obus_low_overhead(binary()) :: [binary()]
+  def split_obus_low_overhead(data) when is_binary(data) do
+    do_split_low_overhead(data, [])
+  end
+
+  defp do_split_low_overhead(<<>>, acc), do: Enum.reverse(acc)
+
+  defp do_split_low_overhead(data, acc) do
+    case parse_obu_with_internal_size(data) do
+      {:ok, obu_binary, rest} ->
+        do_split_low_overhead(rest, [obu_binary | acc])
+
+      :error ->
+        # Fallback: return accumulated OBUs plus remaining data
+        if acc == [], do: [data], else: Enum.reverse([data | acc])
+    end
+  end
+
+  # Parses a single OBU in Low Overhead Bitstream Format (obu_has_size_field=1)
+  defp parse_obu_with_internal_size(<<header::8, rest::binary>> = data) do
+    # OBU header format (AV1 spec section 5.3.1):
+    # - obu_forbidden_bit (1 bit) - must be 0
+    # - obu_type (4 bits) - valid types are 1-8
+    # - obu_extension_flag (1 bit)
+    # - obu_has_size_field (1 bit)
+    # - obu_reserved_1bit (1 bit) - must be 0
+    forbidden = header >>> 7
+    obu_type = (header >>> 3) &&& 0x0F
+    has_extension = (header &&& 0x04) != 0
+    has_size = (header &&& 0x02) != 0
+    reserved_bit = header &&& 0x01
+
+    # Reject invalid OBUs:
+    # - forbidden bit must be 0
+    # - obu_type must be valid (1-8)
+    # - reserved bit must be 0
+    unless forbidden == 0 and obu_type in 1..8 and reserved_bit == 0 do
+      :error
+    else
+      # Calculate header size (1 byte + optional extension byte)
+      {rest_after_header, header_bytes} =
+        if has_extension do
+          case rest do
+            <<_ext::8, r::binary>> -> {r, 2}
+            _ -> {rest, 1}
+          end
+        else
+          {rest, 1}
+        end
+
+      if has_size do
+        # Read LEB128 size field embedded in OBU
+        case leb128_decode_prefix(rest_after_header) do
+          {:ok, {payload_size, leb_bytes, _rest_after_leb}} ->
+            leb_size = byte_size(leb_bytes)
+            total_obu_size = header_bytes + leb_size + payload_size
+
+            if total_obu_size <= byte_size(data) do
+              <<obu::binary-size(total_obu_size), remaining::binary>> = data
+              {:ok, obu, remaining}
+            else
+              :error
+            end
+
+          :error ->
+            :error
+        end
+      else
+        # No size field - this OBU consumes rest of data
+        # This is rare but valid (e.g., temporal delimiter without size field)
+        {:ok, data, <<>>}
+      end
+    end
+  end
+
+  defp parse_obu_with_internal_size(_), do: :error
+
+  @doc """
   Encodes an OBU given its raw payload by prefixing it with a LEB128 length.
   """
   @spec build_obu(binary()) :: binary()
