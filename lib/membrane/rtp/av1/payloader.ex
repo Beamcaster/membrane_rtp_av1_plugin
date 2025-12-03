@@ -11,6 +11,8 @@ defmodule Membrane.RTP.AV1.Payloader do
   """
   use Membrane.Filter
 
+  import Bitwise
+
   alias Membrane.Buffer
   alias Membrane.RTP.AV1.{PayloadFormat, Format}
 
@@ -107,6 +109,7 @@ defmodule Membrane.RTP.AV1.Payloader do
 
   @impl true
   def handle_buffer(:input, %Buffer{payload: access_unit, pts: pts} = _buffer, _ctx, state) do
+    require Membrane.Logger
     header_mode = Map.get(state, :header_mode, :spec)
 
     # Use TU-aware fragmentation for proper marker bit placement
@@ -122,8 +125,6 @@ defmodule Membrane.RTP.AV1.Payloader do
     actions =
       case result do
         {:error, reason, context} ->
-          require Membrane.Logger
-
           Membrane.Logger.error(
             "Failed to fragment access unit: #{inspect(reason)}, context: #{inspect(context)}"
           )
@@ -131,8 +132,23 @@ defmodule Membrane.RTP.AV1.Payloader do
           []
 
         packets_with_markers when is_list(packets_with_markers) ->
-          packets_with_markers
-          |> Enum.map(fn {payload, marker} ->
+          # Debug: Log header bytes of first packet
+          Enum.with_index(packets_with_markers)
+          |> Enum.map(fn {{payload, marker}, idx} ->
+            # Parse and log the AV1 aggregation header
+            <<header_byte, _rest::binary>> = payload
+            z = (header_byte >>> 7) &&& 1
+            y = (header_byte >>> 6) &&& 1
+            w = (header_byte >>> 4) &&& 3
+            n = (header_byte >>> 3) &&& 1
+            reserved = header_byte &&& 7
+            
+            if idx == 0 or marker do
+              Membrane.Logger.warning(
+                "🎬 AV1 Payloader OUT [#{idx}]: Z=#{z}, Y=#{y}, W=#{w}, N=#{n}, reserved=#{reserved}, marker=#{marker}, size=#{byte_size(payload)}, header=0x#{Integer.to_string(header_byte, 16)}"
+              )
+            end
+            
             metadata = %{rtp: %{marker: marker}}
             buffer = %Buffer{payload: payload, pts: pts, metadata: metadata}
             {:buffer, {:output, buffer}}

@@ -16,10 +16,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
   alias Membrane.RTP.AV1.{
     OBU,
     Header,
-    FullHeader,
     FMTP,
-    ScalabilityStructure,
-    OBUHeader,
     OBUValidator,
     TUDetector,
     AggregationOptimizer,
@@ -113,6 +110,12 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     # Detect if this access unit contains a sequence header (OBU type 1)
     # If present, the first RTP packet must have N=1 bit set
     has_sequence_header = SequenceDetector.contains_sequence_header?(access_unit)
+
+    # Debug logging for keyframe detection
+    require Logger
+    if has_sequence_header do
+      Logger.warning("🔑 AV1 Payloader: SEQUENCE HEADER DETECTED - setting N=1 bit")
+    end
 
     # Try to split OBUs - first Low Overhead format (from depayloader),
     # then Annex B format (for backwards compatibility with tests/legacy)
@@ -457,91 +460,62 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
   end
 
   defp encode_header(start?, end?, fragmented?, obu_count, _obus, :draft, _fmtp, n_bit) do
-    # Map to spec-compliant Z/Y/W/N format
-    # Z = not start? (continuation from previous)
-    # Y = not end? (continues in next)
-    # W = min(obu_count, 3) or 0 for length-prefixed
-    # N = n_bit (new coded video sequence)
+    # RFC 9420 compliant header encoding:
+    # Z = continuation from previous packet (first OBU is fragment continuation)
+    # Y = continues in next packet (last OBU will continue)
+    # W = number of OBU elements (0 = length prefixed, 1-3 = that many OBUs)
+    # N = new coded video sequence (keyframe)
 
+    # Z bit: set if this packet starts with a continuation of previous OBU
     z = not start? and fragmented?
+
+    # Y bit: set if last OBU will continue in next packet
     y = not end? and fragmented?
-    w = if fragmented? or obu_count == 0, do: 0, else: min(obu_count, 3)
+
+    # W bit: count of OBU elements in packet
+    # For fragmented single OBU: W=0 (the fragment fills the packet, no length field needed)
+    # For aggregated OBUs: W=count (1-3), last one has no length field
+    w =
+      cond do
+        fragmented? -> 0  # Fragment - OBU fills rest of packet
+        obu_count == 0 -> 0  # Length-prefixed (all have sizes)
+        obu_count in 1..3 -> obu_count  # 1-3 OBUs, last without size
+        obu_count > 3 -> 0  # More than 3 OBUs, use length-prefixed format
+        true -> 0
+      end
 
     header = %Header{z: z, y: y, w: w, n: n_bit}
     Header.encode(header)
   end
 
-  defp encode_header(start?, end?, fragmented?, obu_count, obus, :spec, fmtp, n_bit) do
+  defp encode_header(start?, end?, fragmented?, obu_count, _obus, :spec, _fmtp, n_bit) do
+    # RFC 9420 compliant header encoding:
+    # Z = continuation from previous packet (first OBU is fragment continuation)
+    # Y = continues in next packet (last OBU will continue)
+    # W = number of OBU elements (0 = length prefixed, 1-3 = that many OBUs)
+    # N = new coded video sequence (keyframe)
+    # Bits 2-0: RESERVED (must be 0 for browser compatibility)
+
+    # Z bit: set if this packet starts with a continuation of previous OBU
+    z = not start? and fragmented?
+
+    # Y bit: set if last OBU will continue in next packet
+    y = not end? and fragmented?
+
+    # W bit: count of OBU elements in packet
+    # For fragmented single OBU: W=0 (the fragment fills the packet, no length field needed)
+    # For aggregated OBUs: W=count (1-3), last one has no length field
     w =
       cond do
-        not fragmented? -> 0
-        start? and not end? -> 1
-        not start? and not end? -> 2
-        not start? and end? -> 3
-        # start? and end? and fragmented? should not happen in normal cases
-        # but treat as error/edge case - use W=0
+        fragmented? -> 0  # Fragment - OBU fills rest of packet
+        obu_count == 0 -> 0  # Length-prefixed (all have sizes)
+        obu_count in 1..3 -> obu_count  # 1-3 OBUs, last without size
+        obu_count > 3 -> 0  # More than 3 OBUs, use length-prefixed format
         true -> 0
       end
 
-    # CM bit: Use OBU type analysis if OBUs available, fallback to fmtp.cm or count hint
-    c = determine_cm_bit(obus, obu_count, fmtp)
-
-    # IDS present if tid/lid provided
-    {m, tid, lid} =
-      case {fmtp.temporal_id, fmtp.spatial_id} do
-        {t, l} when is_integer(t) or is_integer(l) ->
-          {true, t || 0, l || 0}
-
-        _ ->
-          {false, nil, nil}
-      end
-
-    # SS present if provided in fmtp and this is the start
-    {z, ss} =
-      case {start?, fmtp.scalability_structure} do
-        {true, %ScalabilityStructure{} = structure} ->
-          {true, structure}
-
-        _ ->
-          {false, nil}
-      end
-
-    FullHeader.encode(%FullHeader{
-      z: z,
-      y: start?,
-      w: w,
-      n: n_bit,
-      c: c,
-      m: m,
-      temporal_id: tid,
-      spatial_id: lid,
-      scalability_structure: ss
-    })
-  end
-
-  # Determines CM bit based on OBU types
-  defp determine_cm_bit(obus, obu_count, fmtp) when is_list(obus) and length(obus) > 0 do
-    # Use OBU header analysis for accurate CM determination
-    case OBUHeader.determine_cm_from_obus(obus) do
-      {:ok, cm} ->
-        cm
-
-      {:error, _reason} ->
-        # Fallback to fmtp or heuristic if parsing fails
-        fallback_cm(obu_count, fmtp)
-    end
-  end
-
-  defp determine_cm_bit(_obus, obu_count, fmtp) do
-    # No OBUs or empty list - use fallback
-    fallback_cm(obu_count, fmtp)
-  end
-
-  defp fallback_cm(obu_count, fmtp) do
-    case fmtp.cm do
-      0 -> 0
-      1 -> 1
-      _ -> if obu_count > 0, do: 1, else: 0
-    end
+    # Use simple Header format for browser compatibility (reserved bits = 0)
+    header = %Header{z: z, y: y, w: w, n: n_bit}
+    Header.encode(header)
   end
 end
