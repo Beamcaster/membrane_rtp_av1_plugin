@@ -16,37 +16,41 @@ defmodule Membrane.RTP.AV1.HeaderValidatorTest do
       assert {:error, :reserved_bit_set} = HeaderValidator.validate_byte0(b0)
     end
 
-    test "rejects W=1 (first fragment) with Y=0" do
+    test "accepts W=1 with Y=0 (single complete OBU)" do
       # Z=0, Y=0, W=1, N=0, C=0, M=0, I=0
+      # RFC 9420: W=1 means 1 OBU element, Y=0 means it's complete (no continuation)
       b0 = 0b0001_0000
-      assert {:error, :invalid_w_y_combination} = HeaderValidator.validate_byte0(b0)
+      assert :ok = HeaderValidator.validate_byte0(b0)
     end
 
-    test "accepts W=1 (first fragment) with Y=1" do
+    test "accepts W=1 with Y=1 (single fragmented OBU)" do
       # Z=0, Y=1, W=1, N=0, C=0, M=0, I=0
+      # RFC 9420: W=1 means 1 OBU element, Y=1 means it continues in next packet
       b0 = 0b0101_0000
       assert :ok = HeaderValidator.validate_byte0(b0)
     end
 
-    test "rejects W=2 (middle fragment) with Y=1" do
+    test "accepts W=2 with Y=1 (2 OBUs, last continues - hybrid aggregation+fragmentation)" do
       # Z=0, Y=1, W=2, N=0, C=0, M=0, I=0
+      # RFC 9420: W=2 means 2 OBU elements, Y=1 means last one continues
       b0 = 0b0110_0000
-      assert {:error, :invalid_w_y_combination} = HeaderValidator.validate_byte0(b0)
+      assert :ok = HeaderValidator.validate_byte0(b0)
     end
 
-    test "accepts W=2 (middle fragment) with Y=0" do
+    test "accepts W=2 with Y=0 (2 complete OBUs)" do
       # Z=0, Y=0, W=2, N=0, C=0, M=0, I=0
       b0 = 0b0010_0000
       assert :ok = HeaderValidator.validate_byte0(b0)
     end
 
-    test "rejects W=3 (last fragment) with Y=1" do
+    test "accepts W=3 with Y=1 (3 OBUs, last continues - hybrid aggregation+fragmentation)" do
       # Z=0, Y=1, W=3, N=0, C=0, M=0, I=0
+      # RFC 9420: W=3 means 3 OBU elements, Y=1 means last one continues
       b0 = 0b0111_0000
-      assert {:error, :invalid_w_y_combination} = HeaderValidator.validate_byte0(b0)
+      assert :ok = HeaderValidator.validate_byte0(b0)
     end
 
-    test "accepts W=3 (last fragment) with Y=0" do
+    test "accepts W=3 with Y=0 (3 complete OBUs)" do
       # Z=0, Y=0, W=3, N=0, C=0, M=0, I=0
       b0 = 0b0011_0000
       assert :ok = HeaderValidator.validate_byte0(b0)
@@ -134,7 +138,7 @@ defmodule Membrane.RTP.AV1.HeaderValidatorTest do
       assert :ok = HeaderValidator.validate_for_encode(header)
     end
 
-    test "rejects first fragment (W=1) without Y=1" do
+    test "accepts W=1 with Y=0 (single complete OBU)" do
       header = %FullHeader{
         z: false,
         y: false,
@@ -144,10 +148,11 @@ defmodule Membrane.RTP.AV1.HeaderValidatorTest do
         m: false
       }
 
-      assert {:error, :invalid_w_y_combination} = HeaderValidator.validate_for_encode(header)
+      # RFC 9420: W=1 means 1 OBU element, Y=0 means complete (valid)
+      assert :ok = HeaderValidator.validate_for_encode(header)
     end
 
-    test "rejects middle fragment (W=2) with Y=1" do
+    test "accepts W=2 with Y=1 (hybrid aggregation+fragmentation)" do
       header = %FullHeader{
         z: false,
         y: true,
@@ -157,7 +162,8 @@ defmodule Membrane.RTP.AV1.HeaderValidatorTest do
         m: false
       }
 
-      assert {:error, :invalid_w_y_combination} = HeaderValidator.validate_for_encode(header)
+      # RFC 9420: W=2 means 2 OBU elements, Y=1 means last continues (valid hybrid)
+      assert :ok = HeaderValidator.validate_for_encode(header)
     end
 
     test "accepts valid header with IDS" do
@@ -276,17 +282,16 @@ defmodule Membrane.RTP.AV1.HeaderValidatorTest do
       assert msg =~ "must be 0"
     end
 
-    test "returns readable message for invalid_w_y_combination" do
-      msg = HeaderValidator.error_message({:error, :invalid_w_y_combination})
-      assert msg =~ "W/Y combination"
-      assert msg =~ "first fragment"
+    test "returns readable message for invalid_w_value" do
+      msg = HeaderValidator.error_message({:error, :invalid_w_value})
+      assert msg =~ "W"
+      assert msg =~ "0-3"
     end
 
     test "returns readable message for all error types" do
       errors = [
         :reserved_bit_set,
         :invalid_w_value,
-        :invalid_w_y_combination,
         :invalid_c_value,
         :invalid_temporal_id,
         :invalid_spatial_id,
@@ -310,10 +315,14 @@ defmodule Membrane.RTP.AV1.HeaderValidatorTest do
       assert {:error, :reserved_bit_set} = FullHeader.decode(binary)
     end
 
-    test "decode rejects invalid W/Y combination" do
-      # W=1, Y=0 (invalid: first fragment must have Y=1)
+    test "decode accepts any valid W/Y combination per RFC 9420" do
+      # W=1, Y=0 (valid: single complete OBU element)
       binary = <<0b0001_0000>>
-      assert {:error, :invalid_w_y_combination} = FullHeader.decode(binary)
+      assert {:ok, %FullHeader{w: 1, y: false}, ""} = FullHeader.decode(binary)
+
+      # W=3, Y=1 (valid: 3 OBU elements, last continues - hybrid)
+      binary2 = <<0b0111_0000>>
+      assert {:ok, %FullHeader{w: 3, y: true}, ""} = FullHeader.decode(binary2)
     end
 
     test "decode rejects IDS byte with reserved bits set" do

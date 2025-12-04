@@ -107,14 +107,18 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
   end
 
   defp fragment_validated(access_unit, max_payload, header_mode, fmtp) do
-    # Detect if this access unit contains a sequence header (OBU type 1)
-    # If present, the first RTP packet must have N=1 bit set
-    has_sequence_header = SequenceDetector.contains_sequence_header?(access_unit)
+    # Detect if this access unit starts a new coded video sequence.
+    # For OBS/SVT-AV1 with continuous intra refresh, this is ANY frame with a sequence header,
+    # as the decoder can start decoding from any such frame.
+    is_keyframe = SequenceDetector.is_new_coded_video_sequence?(access_unit)
 
     # Debug logging for keyframe detection
     require Logger
-    if has_sequence_header do
-      Logger.warning("🔑 AV1 Payloader: SEQUENCE HEADER DETECTED - setting N=1 bit")
+
+    if is_keyframe do
+      Logger.info(
+        "🔑 AV1 Payloader: New coded video sequence (has sequence header) - setting N=1 bit"
+      )
     end
 
     # Try to split OBUs - first Low Overhead format (from depayloader),
@@ -123,19 +127,44 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
       case OBU.split_obus_low_overhead(access_unit) do
         [^access_unit] ->
           # Low Overhead parsing failed, try Annex B format
-          OBU.split_obus(access_unit)
+          Logger.warning(
+            "⚠️ OBU split: Low Overhead FAILED for #{byte_size(access_unit)} bytes, trying Annex B format"
+          )
+
+          annex_b_obus = OBU.split_obus(access_unit)
+
+          if annex_b_obus == [access_unit] do
+            Logger.error(
+              "❌ OBU split: Both Low Overhead and Annex B parsing FAILED! Falling back to naive fragmentation"
+            )
+          else
+            Logger.info("✅ OBU split: Annex B format detected, #{length(annex_b_obus)} OBUs")
+          end
+
+          annex_b_obus
 
         low_overhead_obus ->
+          obu_types =
+            Enum.map(low_overhead_obus, fn <<_::1, type::4, _::3, _::binary>> -> type end)
+
+          Logger.info(
+            "✅ OBU split: Low Overhead format, #{length(low_overhead_obus)} OBUs, types=#{inspect(obu_types)}"
+          )
+
           low_overhead_obus
       end
 
     case obus do
       [^access_unit] ->
         # Could not parse into OBUs; fallback to naive fragmentation with headers
-        naive_fragment(access_unit, max_payload, header_mode, fmtp, has_sequence_header)
+        Logger.warning(
+          "⚠️ Using NAIVE fragmentation for #{byte_size(access_unit)} bytes (OBU parsing failed)"
+        )
+
+        naive_fragment(access_unit, max_payload, header_mode, fmtp, is_keyframe)
 
       list ->
-        fragment_obus(list, max_payload, header_mode, fmtp, has_sequence_header)
+        fragment_obus(list, max_payload, header_mode, fmtp, is_keyframe)
     end
     # Zero-copy: Convert IO lists to binaries only at the final step
     |> Enum.map(&IO.iodata_to_binary/1)
@@ -154,17 +183,17 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
 
       _ ->
         # Other errors: try naive fragmentation as best effort
-        # Detect sequence header even in fallback case
-        has_sequence_header = SequenceDetector.contains_sequence_header?(access_unit)
+        # Detect TRUE keyframe (sequence header + keyframe) for N bit
+        is_keyframe = SequenceDetector.is_new_coded_video_sequence?(access_unit)
         # Zero-copy: Convert IO lists to binaries at the final step
-        naive_fragment(access_unit, max_payload, header_mode, fmtp, has_sequence_header)
+        naive_fragment(access_unit, max_payload, header_mode, fmtp, is_keyframe)
         |> Enum.map(&IO.iodata_to_binary/1)
     end
   end
 
-  defp fragment_obus(obus, max_payload, header_mode, fmtp, has_sequence_header) do
+  defp fragment_obus(obus, max_payload, header_mode, fmtp, is_keyframe) do
     packets =
-      do_fragment_obus(obus, max_payload, {[], 0, []}, [], header_mode, fmtp, has_sequence_header)
+      do_fragment_obus(obus, max_payload, {[], []}, [], header_mode, fmtp, is_keyframe)
       |> Enum.reverse()
 
     # Emit telemetry for aggregation metrics
@@ -195,9 +224,13 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
 
   # Accumulate complete OBUs as long as they fit; if one OBU is too large,
   # fragment it across packets.
-  # State tuple: {group_iolist, count, obus_in_group}
-  # Zero-copy: Use IO lists for accumulation instead of binary concatenation
+  # State tuple: {rtp_obus, raw_obus_in_group} where rtp_obus are already converted to RTP format
   # is_first_packet: true for first packet (may set N=1), false for subsequent packets
+  #
+  # RFC 9420 COMPLIANCE:
+  # - OBUs in RTP packets MUST have obu_has_size_field=0
+  # - For W>0: all but last OBU have LEB128 length prefix
+  # - For last OBU: no length prefix (extends to end of packet)
 
   # Function head with default parameter
   defp do_fragment_obus(
@@ -207,28 +240,34 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
          acc,
          header_mode,
          fmtp,
-         has_sequence_header,
+         is_keyframe,
          is_first_packet \\ true
        )
 
   defp do_fragment_obus(
          [],
          _max_payload,
-         {group_iolist, count, obus_in_group},
+         {rtp_obus, raw_obus_in_group},
          acc,
          header_mode,
          fmtp,
-         has_sequence_header,
+         is_keyframe,
          is_first_packet
        ) do
+    count = length(rtp_obus)
+
     if count == 0 do
       acc
     else
-      # Flatten IO list only when creating final packet
-      payload = IO.iodata_to_binary(group_iolist)
-      # N bit: set only on first packet if sequence header present
-      n_bit = has_sequence_header and is_first_packet
-      header = encode_header(false, true, false, count, obus_in_group, header_mode, fmtp, n_bit)
+      # Build packet payload from RTP-formatted OBUs
+      # All but last OBU get LEB128 length prefix per RFC 9420
+      payload = build_aggregated_payload(Enum.reverse(rtp_obus))
+      # N bit: set only on first packet if this is a TRUE keyframe
+      n_bit = is_keyframe and is_first_packet
+
+      header =
+        encode_header(false, true, false, count, raw_obus_in_group, header_mode, fmtp, n_bit)
+
       pkt = [header | payload]
       [pkt | acc]
     end
@@ -237,81 +276,210 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
   defp do_fragment_obus(
          [obu | rest],
          max_payload,
-         {group_iolist, count, obus_in_group},
+         {rtp_obus, raw_obus_in_group},
          acc,
          header_mode,
          fmtp,
-         has_sequence_header,
+         is_keyframe,
          is_first_packet
        ) do
-    # Calculate current group size by flattening IO list
-    group_payload_size = IO.iodata_length(group_iolist)
-    obu_size = byte_size(obu)
-    # Maximum OBU count is 31 (5 bits in header)
-    max_obu_count = 31
+    current_count = length(rtp_obus)
+    # Maximum OBU count is 3 (W field only supports 0-3)
+    # W=0 means use length-prefixed format for all OBUs
+    max_obu_count = 3
 
-    cond do
-      # Can fit this OBU and haven't exceeded max count
-      group_payload_size + obu_size <= max_payload and count < max_obu_count ->
-        # Zero-copy: Append to IO list instead of binary concatenation
-        new_group = [group_iolist | obu]
+    # Convert OBU to RTP format (strip internal size field)
+    case OBU.to_rtp_obu_element(obu) do
+      {:ok, rtp_obu_no_size} ->
+        # Calculate size with LEB128 prefix (for all but last OBU)
+        _rtp_obu_size_with_prefix =
+          byte_size(OBU.leb128_encode(byte_size(rtp_obu_no_size))) + byte_size(rtp_obu_no_size)
+
+        rtp_obu_size_no_prefix = byte_size(rtp_obu_no_size)
+
+        # Calculate current payload size
+        current_payload_size = Enum.reduce(rtp_obus, 0, fn rtp, acc -> acc + byte_size(rtp) end)
+
+        # Can we fit this OBU?
+        # If this is not the last OBU, we need to account for LEB128 prefix
+        # But we don't know if more OBUs will come, so assume this could be last (no prefix)
+        # We'll add prefix when we know it's not the last one
+
+        cond do
+          # Can fit this OBU and haven't exceeded max count
+          current_payload_size + rtp_obu_size_no_prefix <= max_payload and
+              current_count < max_obu_count ->
+            # Add to group - we'll add LEB128 prefix when flushing if not last
+            do_fragment_obus(
+              rest,
+              max_payload,
+              {[rtp_obu_no_size | rtp_obus], [obu | raw_obus_in_group]},
+              acc,
+              header_mode,
+              fmtp,
+              is_keyframe,
+              is_first_packet
+            )
+
+          current_count > 0 ->
+            # RFC 9420: Aggregation + Fragmentation hybrid case
+            # When we have accumulated OBUs and the next OBU is too large,
+            # we should include the START of the large OBU in the same packet
+            # to properly signal Y=1 (continues in next packet)
+
+            # Calculate space used by accumulated OBUs (with LEB128 prefixes for all)
+            accumulated_with_prefixes =
+              Enum.reduce(rtp_obus, 0, fn rtp, acc_size ->
+                acc_size + byte_size(OBU.leb128_encode(byte_size(rtp))) + byte_size(rtp)
+              end)
+
+            remaining_space = max_payload - accumulated_with_prefixes
+
+            if remaining_space > 0 and rtp_obu_size_no_prefix > max_payload do
+              # Include first chunk of the large OBU in this packet
+              # This creates a hybrid aggregation+fragmentation packet
+              first_chunk_size = remaining_space
+              first_chunk = :binary.part(rtp_obu_no_size, 0, first_chunk_size)
+
+              remaining_obu =
+                :binary.part(
+                  rtp_obu_no_size,
+                  first_chunk_size,
+                  rtp_obu_size_no_prefix - first_chunk_size
+                )
+
+              # Build payload: all accumulated OBUs get LEB128 prefix, then first chunk (no prefix, extends to end)
+              prefixed_obus =
+                Enum.map(Enum.reverse(rtp_obus), fn rtp ->
+                  OBU.leb128_encode(byte_size(rtp)) <> rtp
+                end)
+
+              payload = IO.iodata_to_binary(prefixed_obus ++ [first_chunk])
+
+              # W = count + 1 (accumulated OBUs + the fragment)
+              # But W maxes out at 3, so use min
+              count = min(current_count + 1, 3)
+              n_bit = is_keyframe and is_first_packet
+
+              # Y=1 because the last OBU element (frame fragment) continues in next packet
+              # start?=true (first fragment of this OBU), end?=false (continues), fragmented?=true
+              header = encode_header_hybrid(count, n_bit, header_mode)
+              pkt = [header | payload]
+              acc = [pkt | acc]
+
+              # Continue fragmenting the remaining part of this OBU
+              acc =
+                fragment_remaining_obu(
+                  remaining_obu,
+                  max_payload,
+                  acc,
+                  header_mode,
+                  fmtp
+                )
+
+              # Process remaining OBUs
+              do_fragment_obus(
+                rest,
+                max_payload,
+                {[], []},
+                acc,
+                header_mode,
+                fmtp,
+                is_keyframe,
+                false
+              )
+            else
+              # Not enough space or OBU fits in single packet - use original flush logic
+              # Build payload: all but last get LEB128 prefix
+              payload = build_aggregated_payload(Enum.reverse(rtp_obus))
+              count = current_count
+              n_bit = is_keyframe and is_first_packet
+
+              header =
+                encode_header(
+                  false,
+                  true,
+                  false,
+                  count,
+                  raw_obus_in_group,
+                  header_mode,
+                  fmtp,
+                  n_bit
+                )
+
+              pkt = [header | payload]
+              acc = [pkt | acc]
+              # After first packet, set is_first_packet to false
+              do_fragment_obus(
+                [obu | rest],
+                max_payload,
+                {[], []},
+                acc,
+                header_mode,
+                fmtp,
+                is_keyframe,
+                false
+              )
+            end
+
+          true ->
+            # Fragment this single OBU (it's too large to fit in one packet)
+            acc =
+              fragment_single_obu(
+                # Already stripped of size field
+                rtp_obu_no_size,
+                max_payload,
+                acc,
+                header_mode,
+                fmtp,
+                is_keyframe,
+                is_first_packet
+              )
+
+            # After fragmenting, subsequent packets have is_first_packet = false
+            do_fragment_obus(
+              rest,
+              max_payload,
+              {[], []},
+              acc,
+              header_mode,
+              fmtp,
+              is_keyframe,
+              false
+            )
+        end
+
+      :error ->
+        # Failed to convert OBU - skip it and continue
+        require Logger
+        Logger.error("Failed to convert OBU to RTP format, skipping")
 
         do_fragment_obus(
           rest,
           max_payload,
-          {new_group, count + 1, [obu | obus_in_group]},
+          {rtp_obus, raw_obus_in_group},
           acc,
           header_mode,
           fmtp,
-          has_sequence_header,
+          is_keyframe,
           is_first_packet
         )
-
-      group_payload_size > 0 and count > 0 ->
-        # Flush current group, then reconsider this OBU
-        payload = IO.iodata_to_binary(group_iolist)
-        # N bit: set only on first packet if sequence header present
-        n_bit = has_sequence_header and is_first_packet
-        header = encode_header(false, true, false, count, obus_in_group, header_mode, fmtp, n_bit)
-        pkt = [header | payload]
-        acc = [pkt | acc]
-        # After first packet, set is_first_packet to false
-        do_fragment_obus(
-          [obu | rest],
-          max_payload,
-          {[], 0, []},
-          acc,
-          header_mode,
-          fmtp,
-          has_sequence_header,
-          false
-        )
-
-      true ->
-        # Fragment this single OBU
-        acc =
-          fragment_single_obu(
-            obu,
-            max_payload,
-            acc,
-            header_mode,
-            fmtp,
-            has_sequence_header,
-            is_first_packet
-          )
-
-        # After fragmenting (which creates packets), subsequent packets have is_first_packet = false
-        do_fragment_obus(
-          rest,
-          max_payload,
-          {[], 0, []},
-          acc,
-          header_mode,
-          fmtp,
-          has_sequence_header,
-          false
-        )
     end
+  end
+
+  # Build aggregated payload: all but last OBU get LEB128 length prefix
+  defp build_aggregated_payload([]), do: <<>>
+  defp build_aggregated_payload([single]), do: single
+
+  defp build_aggregated_payload(rtp_obus) do
+    {all_but_last, [last]} = Enum.split(rtp_obus, length(rtp_obus) - 1)
+
+    prefixed =
+      Enum.map(all_but_last, fn obu ->
+        OBU.leb128_encode(byte_size(obu)) <> obu
+      end)
+
+    IO.iodata_to_binary(prefixed ++ [last])
   end
 
   defp fragment_single_obu(
@@ -320,7 +488,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
          acc,
          header_mode,
          fmtp,
-         has_sequence_header,
+         is_keyframe,
          is_first_packet
        ) do
     total = byte_size(obu)
@@ -335,7 +503,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
         true,
         header_mode,
         fmtp,
-        has_sequence_header,
+        is_keyframe,
         is_first_packet
       )
 
@@ -352,7 +520,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
          start?,
          header_mode,
          fmtp,
-         has_sequence_header,
+         is_keyframe,
          is_first_packet
        ) do
     remaining = total_size - offset
@@ -362,9 +530,9 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     # Zero-copy: Use binary_part to reference bytes without copying
     chunk = :binary.part(original_obu, offset, chunk_size)
 
-    # N bit: set only on first fragment if this is the first packet and has sequence header
+    # N bit: set only on first fragment if this is the first packet AND is a true keyframe
     # start? indicates if this is the first fragment of this OBU
-    n_bit = has_sequence_header and is_first_packet and start?
+    n_bit = is_keyframe and is_first_packet and start?
 
     # Zero-copy: Build packet as IO list [header | chunk] instead of binary concatenation
     header = encode_header(start?, is_last?, true, 0, [original_obu], header_mode, fmtp, n_bit)
@@ -383,14 +551,14 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
         false,
         header_mode,
         fmtp,
-        has_sequence_header,
+        is_keyframe,
         # After first fragment, no longer first packet
         false
       )
     end
   end
 
-  defp naive_fragment(binary, max_payload, header_mode, fmtp, has_sequence_header) do
+  defp naive_fragment(binary, max_payload, header_mode, fmtp, is_keyframe) do
     do_naive_fragment(
       binary,
       0,
@@ -400,7 +568,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
       true,
       header_mode,
       fmtp,
-      has_sequence_header
+      is_keyframe
     )
   end
 
@@ -414,7 +582,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
          _is_first,
          _header_mode,
          _fmtp,
-         _has_sequence_header
+         _is_keyframe
        )
        when offset >= total_size do
     Enum.reverse(acc)
@@ -429,7 +597,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
          is_first,
          header_mode,
          fmtp,
-         has_sequence_header
+         is_keyframe
        ) do
     remaining = total_size - offset
     chunk_size = min(max, remaining)
@@ -438,8 +606,8 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     # Zero-copy: Use binary_part to reference bytes
     chunk = :binary.part(bin, offset, chunk_size)
 
-    # N bit: set only on first packet if sequence header present
-    n_bit = has_sequence_header and is_first
+    # N bit: set only on first packet if this is a true keyframe
+    n_bit = is_keyframe and is_first
 
     # Build packet as IO list
     # fragmented? = true because we're fragmenting (multiple packets)
@@ -455,8 +623,48 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
       false,
       header_mode,
       fmtp,
-      has_sequence_header
+      is_keyframe
     )
+  end
+
+  # Helper for hybrid aggregation+fragmentation header
+  # Z=0 (first packet doesn't continue from previous)
+  # Y=1 (last OBU element continues in next packet)
+  # W=count (number of OBU elements)
+  # N=n_bit (keyframe indicator)
+  defp encode_header_hybrid(count, n_bit, _header_mode) do
+    # RFC 9420 hybrid packet: complete OBUs + start of fragmented OBU
+    header = %Header{z: false, y: true, w: count, n: n_bit}
+    Header.encode(header)
+  end
+
+  # Fragment the remaining portion of an OBU that was partially included
+  # in a hybrid aggregation+fragmentation packet
+  defp fragment_remaining_obu(remaining_obu, max_payload, acc, header_mode, _fmtp) do
+    total = byte_size(remaining_obu)
+    do_fragment_remaining(remaining_obu, 0, total, max_payload, acc, header_mode)
+  end
+
+  defp do_fragment_remaining(obu, offset, total, max_payload, acc, header_mode) do
+    remaining = total - offset
+    chunk_size = min(max_payload, remaining)
+    is_last? = chunk_size >= remaining
+
+    chunk = :binary.part(obu, offset, chunk_size)
+
+    # Z=1 (continuation from previous packet)
+    # Y=1 if more fragments follow, Y=0 if this is the last
+    # W=1 (single OBU element extends to end of packet)
+    # N=0 (not first packet of sequence)
+    header = %Header{z: true, y: not is_last?, w: 1, n: false}
+    pkt = [Header.encode(header) | chunk]
+    acc = [pkt | acc]
+
+    if is_last? do
+      acc
+    else
+      do_fragment_remaining(obu, offset + chunk_size, total, max_payload, acc, header_mode)
+    end
   end
 
   defp encode_header(start?, end?, fragmented?, obu_count, _obus, :draft, _fmtp, n_bit) do
@@ -473,14 +681,21 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     y = not end? and fragmented?
 
     # W bit: count of OBU elements in packet
-    # For fragmented single OBU: W=0 (the fragment fills the packet, no length field needed)
-    # For aggregated OBUs: W=count (1-3), last one has no length field
+    # RFC 9420 Section 4.2.2:
+    # - W=0: Length-prefixed format (all OBUs have LEB128 size prefix)
+    # - W=1-3: That many OBU elements, last without length prefix
+    # For fragmented OBUs: W=1 (single OBU element extends to end of packet)
+    # For aggregated OBUs: W=count (1-3), last one has no length prefix
     w =
       cond do
-        fragmented? -> 0  # Fragment - OBU fills rest of packet
-        obu_count == 0 -> 0  # Length-prefixed (all have sizes)
-        obu_count in 1..3 -> obu_count  # 1-3 OBUs, last without size
-        obu_count > 3 -> 0  # More than 3 OBUs, use length-prefixed format
+        # Fragment - single OBU element fills rest of packet (W=1, no LEB128 size)
+        fragmented? -> 1
+        # Length-prefixed (all have sizes)
+        obu_count == 0 -> 0
+        # 1-3 OBUs, last without size
+        obu_count in 1..3 -> obu_count
+        # More than 3 OBUs, use length-prefixed format
+        obu_count > 3 -> 0
         true -> 0
       end
 
@@ -503,14 +718,21 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     y = not end? and fragmented?
 
     # W bit: count of OBU elements in packet
-    # For fragmented single OBU: W=0 (the fragment fills the packet, no length field needed)
-    # For aggregated OBUs: W=count (1-3), last one has no length field
+    # RFC 9420 Section 4.2.2:
+    # - W=0: Length-prefixed format (all OBUs have LEB128 size prefix)
+    # - W=1-3: That many OBU elements, last without length prefix
+    # For fragmented OBUs: W=1 (single OBU element extends to end of packet)
+    # For aggregated OBUs: W=count (1-3), last one has no length prefix
     w =
       cond do
-        fragmented? -> 0  # Fragment - OBU fills rest of packet
-        obu_count == 0 -> 0  # Length-prefixed (all have sizes)
-        obu_count in 1..3 -> obu_count  # 1-3 OBUs, last without size
-        obu_count > 3 -> 0  # More than 3 OBUs, use length-prefixed format
+        # Fragment - single OBU element fills rest of packet (W=1, no LEB128 size)
+        fragmented? -> 1
+        # Length-prefixed (all have sizes)
+        obu_count == 0 -> 0
+        # 1-3 OBUs, last without size
+        obu_count in 1..3 -> obu_count
+        # More than 3 OBUs, use length-prefixed format
+        obu_count > 3 -> 0
         true -> 0
       end
 

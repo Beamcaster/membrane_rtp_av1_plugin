@@ -64,7 +64,7 @@ defmodule Membrane.RTP.AV1.OBU do
     # - obu_has_size_field (1 bit)
     # - obu_reserved_1bit (1 bit) - must be 0
     forbidden = header >>> 7
-    obu_type = (header >>> 3) &&& 0x0F
+    obu_type = header >>> 3 &&& 0x0F
     has_extension = (header &&& 0x04) != 0
     has_size = (header &&& 0x02) != 0
     reserved_bit = header &&& 0x01
@@ -136,8 +136,9 @@ defmodule Membrane.RTP.AV1.OBU do
   defp do_leb128_decode(<<>>, _shift, _acc, _bytes), do: :error
 
   defp do_leb128_decode(<<byte, rest::binary>>, shift, acc, bytes) do
-    value = acc ||| ((byte &&& 0x7F) <<< shift)
+    value = acc ||| (byte &&& 0x7F) <<< shift
     bytes_acc = [byte | bytes]
+
     if (byte &&& 0x80) == 0 do
       leb = bytes_acc |> Enum.reverse() |> :erlang.list_to_binary()
       {:ok, {value, leb, rest}}
@@ -162,5 +163,95 @@ defmodule Membrane.RTP.AV1.OBU do
   defp do_leb128_encode(value, acc) do
     byte = bor(band(value, 0x7F), 0x80)
     do_leb128_encode(value >>> 7, [byte | acc])
+  end
+
+  @doc """
+  Strips the internal size field from an OBU and returns the OBU data
+  with obu_has_size_field=0, as required by RFC 9420.
+
+  Input: OBU with obu_has_size_field=1 (Low Overhead format)
+  Output: OBU with obu_has_size_field=0 (RTP format)
+
+  Returns {:ok, obu_without_size} or :error.
+  """
+  @spec strip_obu_size_field(binary()) :: {:ok, binary()} | :error
+  def strip_obu_size_field(<<header::8, rest::binary>>) do
+    # OBU header format:
+    # - obu_forbidden_bit (1 bit)
+    # - obu_type (4 bits)
+    # - obu_extension_flag (1 bit)
+    # - obu_has_size_field (1 bit)
+    # - obu_reserved_1bit (1 bit)
+    has_extension = (header &&& 0x04) != 0
+    has_size = (header &&& 0x02) != 0
+
+    # Clear the obu_has_size_field bit
+    new_header = header &&& 0xFD
+
+    if has_size do
+      # Skip extension byte if present
+      {rest_after_ext, ext_byte} =
+        if has_extension do
+          case rest do
+            <<ext::8, r::binary>> -> {r, <<ext::8>>}
+            _ -> {rest, <<>>}
+          end
+        else
+          {rest, <<>>}
+        end
+
+      # Read and skip the LEB128 size field
+      case leb128_decode_prefix(rest_after_ext) do
+        {:ok, {_size, _leb_bytes, obu_payload}} ->
+          # Reconstruct OBU: new_header + extension (if any) + payload (no size field)
+          {:ok, <<new_header::8>> <> ext_byte <> obu_payload}
+
+        :error ->
+          :error
+      end
+    else
+      # No size field to strip
+      {:ok, <<new_header::8, rest::binary>>}
+    end
+  end
+
+  def strip_obu_size_field(_), do: :error
+
+  @doc """
+  Converts an OBU to RTP OBU element format with LEB128 length prefix.
+
+  Input: OBU with obu_has_size_field=1 (Low Overhead format)
+  Output: LEB128 length prefix + OBU with obu_has_size_field=0 (RTP format)
+
+  This is used for all but the last OBU in an RTP packet with W>0.
+
+  Returns {:ok, rtp_obu_element} or :error.
+  """
+  @spec to_rtp_obu_element_with_size(binary()) :: {:ok, binary()} | :error
+  def to_rtp_obu_element_with_size(obu) do
+    case strip_obu_size_field(obu) do
+      {:ok, obu_without_size} ->
+        size = byte_size(obu_without_size)
+        leb = leb128_encode(size)
+        {:ok, leb <> obu_without_size}
+
+      :error ->
+        :error
+    end
+  end
+
+  @doc """
+  Converts an OBU to RTP OBU element format WITHOUT length prefix.
+
+  Input: OBU with obu_has_size_field=1 (Low Overhead format)
+  Output: OBU with obu_has_size_field=0 (RTP format, no length prefix)
+
+  This is used for the last OBU in an RTP packet with W>0.
+
+  Returns {:ok, rtp_obu_element} or :error.
+  """
+  @spec to_rtp_obu_element(binary()) :: {:ok, binary()} | :error
+  def to_rtp_obu_element(obu) do
+    strip_obu_size_field(obu)
   end
 end

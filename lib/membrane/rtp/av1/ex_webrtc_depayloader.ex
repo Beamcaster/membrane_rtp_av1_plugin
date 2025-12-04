@@ -60,28 +60,32 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # Membrane Pad Definitions
   # =============================================================================
 
-  def_input_pad :input,
+  def_input_pad(:input,
     accepted_format: RTP,
     flow_control: :auto
+  )
 
-  def_output_pad :output,
+  def_output_pad(:output,
     accepted_format: Format,
     flow_control: :auto
+  )
 
-  def_options max_reorder_buffer: [
-                spec: pos_integer(),
-                default: 10,
-                description: "Maximum packets to buffer for reordering per RTP timestamp"
-              ],
-              require_sequence_header: [
-                spec: boolean(),
-                default: true,
-                description: """
-                When true, cache and prepend sequence headers for AV1 decoder initialization.
-                If a frame arrives without a cached sequence header, a keyframe request will be emitted.
-                Enable this for decoders that require sequence header initialization (e.g., rav1d).
-                """
-              ]
+  def_options(
+    max_reorder_buffer: [
+      spec: pos_integer(),
+      default: 10,
+      description: "Maximum packets to buffer for reordering per RTP timestamp"
+    ],
+    require_sequence_header: [
+      spec: boolean(),
+      default: true,
+      description: """
+      When true, cache and prepend sequence headers for AV1 decoder initialization.
+      If a frame arrives without a cached sequence header, a keyframe request will be emitted.
+      Enable this for decoders that require sequence header initialization (e.g., rav1d).
+      """
+    ]
+  )
 
   # =============================================================================
   # State Definition
@@ -280,13 +284,14 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         - Timestamp: #{timestamp}
         """)
 
-        %{state |
-          cached_sequence_header: new_seq_header,
-          sequence_header_generation: 1,
-          waiting_for_keyframe: false,
-          waiting_for_sequence_header: false,
-          last_n_bit_timestamp: timestamp,
-          frames_since_sequence_header: 0
+        %{
+          state
+          | cached_sequence_header: new_seq_header,
+            sequence_header_generation: 1,
+            waiting_for_keyframe: false,
+            waiting_for_sequence_header: false,
+            last_n_bit_timestamp: timestamp,
+            frames_since_sequence_header: 0
         }
 
       # Sequence header changed (resolution change, profile change, etc.)
@@ -300,24 +305,28 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         Note: Decoder may need reinitialization
         """)
 
-        %{state |
-          cached_sequence_header: new_seq_header,
-          sequence_header_generation: state.sequence_header_generation + 1,
-          waiting_for_keyframe: false,
-          waiting_for_sequence_header: false,
-          last_n_bit_timestamp: timestamp,
-          frames_since_sequence_header: 0
+        %{
+          state
+          | cached_sequence_header: new_seq_header,
+            sequence_header_generation: state.sequence_header_generation + 1,
+            waiting_for_keyframe: false,
+            waiting_for_sequence_header: false,
+            last_n_bit_timestamp: timestamp,
+            frames_since_sequence_header: 0
         }
 
       # Same sequence header (common case - keyframe with same params)
       true ->
-        Membrane.Logger.debug("Sequence header unchanged (generation #{state.sequence_header_generation})")
+        Membrane.Logger.debug(
+          "Sequence header unchanged (generation #{state.sequence_header_generation})"
+        )
 
-        %{state |
-          waiting_for_keyframe: false,
-          waiting_for_sequence_header: false,
-          last_n_bit_timestamp: timestamp,
-          frames_since_sequence_header: 0
+        %{
+          state
+          | waiting_for_keyframe: false,
+            waiting_for_sequence_header: false,
+            last_n_bit_timestamp: timestamp,
+            frames_since_sequence_header: 0
         }
     end
   end
@@ -398,12 +407,13 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     # When starting a new temporal unit (different timestamp), capture PTS
     new_pts = if timestamp != state.current_timestamp, do: pts, else: state.current_pts
 
-    %{state |
-      current_obu_fragment: fragment,
-      current_timestamp: timestamp,
-      current_pts: new_pts,
-      current_temporal_unit:
-        if(timestamp != state.current_timestamp, do: nil, else: state.current_temporal_unit)
+    %{
+      state
+      | current_obu_fragment: fragment,
+        current_timestamp: timestamp,
+        current_pts: new_pts,
+        current_temporal_unit:
+          if(timestamp != state.current_timestamp, do: nil, else: state.current_temporal_unit)
     }
   end
 
@@ -429,10 +439,11 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       cond do
         # Starting new temporal unit - capture PTS from first packet
         state.current_temporal_unit == nil ->
-          %{state |
-            current_temporal_unit: filtered_data,
-            current_timestamp: timestamp,
-            current_pts: pts
+          %{
+            state
+            | current_temporal_unit: filtered_data,
+              current_timestamp: timestamp,
+              current_pts: pts
           }
 
         # Different timestamp - new temporal unit (previous one incomplete)
@@ -443,10 +454,11 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
           Dropping incomplete temporal unit
           """)
 
-          %{state |
-            current_temporal_unit: filtered_data,
-            current_timestamp: timestamp,
-            current_pts: pts
+          %{
+            state
+            | current_temporal_unit: filtered_data,
+              current_timestamp: timestamp,
+              current_pts: pts
           }
 
         # Same timestamp - append to current temporal unit (keep existing PTS)
@@ -480,6 +492,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
           Sequence header changed WITHOUT N=1 bit set - this is unusual
           Caching new sequence header anyway
           """)
+
           handle_sequence_header_received(state, seq_header, timestamp)
 
         _seq_header ->
@@ -533,9 +546,10 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     # Build output with proper sequence header handling
     {buffer_actions, new_state} = build_output_with_sequence_header(temporal_unit, pts, state)
 
-    new_state = %{new_state |
-      stream_format_sent: true,
-      frames_since_sequence_header: new_state.frames_since_sequence_header + 1
+    new_state = %{
+      new_state
+      | stream_format_sent: true,
+        frames_since_sequence_header: new_state.frames_since_sequence_header + 1
     }
 
     {format_actions ++ buffer_actions, new_state}
@@ -559,8 +573,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     # Update state with any sequence header found
     state =
       if analysis.sequence_header != nil and
-         (state.cached_sequence_header == nil or
-          analysis.sequence_header != state.cached_sequence_header) do
+           (state.cached_sequence_header == nil or
+              analysis.sequence_header != state.cached_sequence_header) do
         Membrane.Logger.info("Updating cached sequence header from temporal unit content")
         handle_sequence_header_received(state, analysis.sequence_header, state.current_timestamp)
       else
@@ -572,20 +586,24 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       state.cached_sequence_header == nil and analysis.has_frame ->
         Membrane.Logger.warning("""
         Cannot output frame - no sequence header available
-        Requesting keyframe to get sequence header for decoder initialization
+        Requesting keyframe (PLI) via upstream event to get sequence header for decoder initialization
         """)
 
-        {[event: {:output, %Membrane.KeyframeRequestEvent{}}],
+        # Send KeyframeRequestEvent to :input pad to propagate UPSTREAM toward the source
+        # This will eventually reach RTPSource which sends PLI to the WebRTC peer
+        {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
          %{state | waiting_for_keyframe: true}}
 
       # Have cached sequence header but temporal unit doesn't include one - prepend it
       state.cached_sequence_header != nil and
         analysis.sequence_header == nil and
-        analysis.has_frame ->
-        output = build_complete_temporal_unit(
-          state.cached_sequence_header,
-          temporal_unit
-        )
+          analysis.has_frame ->
+        output =
+          build_complete_temporal_unit(
+            state.cached_sequence_header,
+            temporal_unit
+          )
+
         buffer = build_buffer(output, pts)
         {[buffer: {:output, buffer}], state}
 
@@ -638,11 +656,12 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # -----------------------------------------------------------------------------
 
   defp reset_depayloader(state) do
-    %{state |
-      current_temporal_unit: nil,
-      current_timestamp: nil,
-      current_pts: nil,
-      current_obu_fragment: nil
+    %{
+      state
+      | current_temporal_unit: nil,
+        current_timestamp: nil,
+        current_pts: nil,
+        current_obu_fragment: nil
     }
   end
 
@@ -662,7 +681,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     # - obu_reserved_1bit (1 bit)
 
     forbidden_bit = header >>> 7
-    obu_type = (header >>> 3) &&& 0x0F
+    obu_type = header >>> 3 &&& 0x0F
     has_extension = (header &&& 0x04) != 0
     has_size = (header &&& 0x02) != 0
 
@@ -674,8 +693,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         if has_extension do
           case rest do
             <<ext_header::8, r::binary>> ->
-              temporal_id = (ext_header >>> 5) &&& 0x07
-              spatial_id = (ext_header >>> 3) &&& 0x03
+              temporal_id = ext_header >>> 5 &&& 0x07
+              spatial_id = ext_header >>> 3 &&& 0x03
               {r, 1, %{temporal_id: temporal_id, spatial_id: spatial_id}}
 
             _ ->
@@ -685,14 +704,15 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
           {rest, 0, nil}
         end
 
-      {:ok, %{
-        type: obu_type,
-        has_size: has_size,
-        has_extension: has_extension,
-        extension: extension_header,
-        header_bytes: 1 + extension_bytes,
-        rest: rest_after_ext
-      }}
+      {:ok,
+       %{
+         type: obu_type,
+         has_size: has_size,
+         has_extension: has_extension,
+         extension: extension_header,
+         header_bytes: 1 + extension_bytes,
+         rest: rest_after_ext
+       }}
     end
   end
 
@@ -763,10 +783,10 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     case rest do
       <<header::8, _::binary>> ->
         forbidden_bit = header >>> 7
-        obu_type = (header >>> 3) &&& 0x0F
+        obu_type = header >>> 3 &&& 0x0F
 
         # Valid OBU: forbidden bit = 0, type in valid range
-        if forbidden_bit == 0 and obu_type in 1..8 or obu_type == 15 do
+        if (forbidden_bit == 0 and obu_type in 1..8) or obu_type == 15 do
           {:found, offset}
         else
           scan_for_obu_boundary(data, offset + 1)

@@ -1,19 +1,21 @@
 defmodule Membrane.RTP.AV1.HeaderValidator do
   @moduledoc """
-  Strict validation of AV1 RTP header bit combinations per spec.
+  Strict validation of AV1 RTP header bit combinations per RFC 9420.
 
   Enforces:
   - Reserved bit constraints (must be 0)
-  - Valid W bit state transitions and combinations
+  - Valid W bit values (0-3)
   - Z/Y/W/N/CM bit compatibility rules
   - IDS byte validation when M=1
+
+  Note: Per RFC 9420, any W (0-3) can be combined with any Y value.
+  W indicates the number of OBU elements, Y indicates if the last continues.
   """
 
   @type validation_error ::
           {:error,
            :reserved_bit_set
            | :invalid_w_value
-           | :invalid_w_y_combination
            | :invalid_c_value
            | :invalid_temporal_id
            | :invalid_spatial_id
@@ -95,39 +97,21 @@ defmodule Membrane.RTP.AV1.HeaderValidator do
   defp validate_w_value(_), do: {:error, :invalid_w_value}
 
   defp validate_w_y_combination(w, y) do
-    # Per spec: When W != 0 (fragmented), Y should indicate first fragment
-    # W=1 (first fragment) should have Y=true
-    # W=2 (middle fragment) should have Y=false
-    # W=3 (last fragment) should have Y=false
-    # W=0 (not fragmented) can have Y either true or false
-    case {w, y} do
-      {0, _} ->
-        # Not fragmented, Y can be anything
+    # RFC 9420: W indicates number of OBU elements, Y indicates if last element continues.
+    # Any valid W (0-3) can be combined with any Y value.
+    # 
+    # Examples of valid combinations:
+    # - W=3, Y=1: 3 OBU elements, last one continues (hybrid aggregation+fragmentation)
+    # - W=2, Y=1: 2 OBU elements, last one continues
+    # - W=1, Y=0: 1 OBU element, complete in this packet
+    # - W=1, Y=1: 1 OBU element fragment, continues in next packet
+    # - W=0, Y=0/1: All OBUs have LEB128 size prefix
+    case w do
+      w when w in 0..3 ->
+        # Y can be true or false for any valid W value
+        # Suppress unused variable warning
+        _ = y
         :ok
-
-      {1, true} ->
-        # First fragment with Y=true is correct
-        :ok
-
-      {1, false} ->
-        # First fragment should have Y=true per spec
-        {:error, :invalid_w_y_combination}
-
-      {2, false} ->
-        # Middle fragment with Y=false is correct
-        :ok
-
-      {2, true} ->
-        # Middle fragment should not have Y=true
-        {:error, :invalid_w_y_combination}
-
-      {3, false} ->
-        # Last fragment with Y=false is correct
-        :ok
-
-      {3, true} ->
-        # Last fragment should not have Y=true
-        {:error, :invalid_w_y_combination}
 
       _ ->
         {:error, :invalid_w_value}
@@ -178,11 +162,7 @@ defmodule Membrane.RTP.AV1.HeaderValidator do
   end
 
   def error_message({:error, :invalid_w_value}) do
-    "W (fragmentation state) must be 0-3"
-  end
-
-  def error_message({:error, :invalid_w_y_combination}) do
-    "Invalid W/Y combination: W=1 (first fragment) must have Y=1, W=2/3 (middle/last) must have Y=0"
+    "W (OBU element count) must be 0-3"
   end
 
   def error_message({:error, :invalid_c_value}) do

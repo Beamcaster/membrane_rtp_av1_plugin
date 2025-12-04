@@ -27,9 +27,9 @@ defmodule Membrane.RTP.AV1.Payloader do
   def_options(
     mtu: [
       spec: pos_integer(),
-      default: 4500,
+      default: 1200,
       description:
-        "Maximum RTP payload size in bytes. Default: 1200 (safe), Max: 9000 (jumbo frames). Can be changed dynamically via MTUUpdateEvent."
+        "Maximum RTP payload size in bytes. Default: 1200 (safe for WebRTC). Can be changed dynamically via MTUUpdateEvent."
     ],
     fmtp: [
       spec: map(),
@@ -137,18 +137,17 @@ defmodule Membrane.RTP.AV1.Payloader do
           |> Enum.map(fn {{payload, marker}, idx} ->
             # Parse and log the AV1 aggregation header
             <<header_byte, _rest::binary>> = payload
-            z = (header_byte >>> 7) &&& 1
-            y = (header_byte >>> 6) &&& 1
-            w = (header_byte >>> 4) &&& 3
-            n = (header_byte >>> 3) &&& 1
+            z = header_byte >>> 7 &&& 1
+            y = header_byte >>> 6 &&& 1
+            w = header_byte >>> 4 &&& 3
+            n = header_byte >>> 3 &&& 1
             reserved = header_byte &&& 7
-            
-            if idx == 0 or marker do
-              Membrane.Logger.warning(
-                "🎬 AV1 Payloader OUT [#{idx}]: Z=#{z}, Y=#{y}, W=#{w}, N=#{n}, reserved=#{reserved}, marker=#{marker}, size=#{byte_size(payload)}, header=0x#{Integer.to_string(header_byte, 16)}"
-              )
-            end
-            
+
+            # Log ALL packets, not just first and last
+            Membrane.Logger.warning(
+              "🎬 AV1 Payloader OUT [#{idx}]: Z=#{z}, Y=#{y}, W=#{w}, N=#{n}, reserved=#{reserved}, marker=#{marker}, size=#{byte_size(payload)}, header=0x#{Integer.to_string(header_byte, 16)}"
+            )
+
             metadata = %{rtp: %{marker: marker}}
             buffer = %Buffer{payload: payload, pts: pts, metadata: metadata}
             {:buffer, {:output, buffer}}
