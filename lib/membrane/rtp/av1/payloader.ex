@@ -144,7 +144,7 @@ defmodule Membrane.RTP.AV1.Payloader do
             reserved = header_byte &&& 7
 
             # Log ALL packets, not just first and last
-            Membrane.Logger.warning(
+            Membrane.Logger.debug(
               "🎬 AV1 Payloader OUT [#{idx}]: Z=#{z}, Y=#{y}, W=#{w}, N=#{n}, reserved=#{reserved}, marker=#{marker}, size=#{byte_size(payload)}, header=0x#{Integer.to_string(header_byte, 16)}"
             )
 

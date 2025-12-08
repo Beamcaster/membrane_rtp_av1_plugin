@@ -3,7 +3,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   RTP depayloader for AV1 video streams using ExWebRTC-style parsing.
 
   This element reassembles AV1 temporal units from RTP packets according to
-  [RTP Payload Format for AV1 v1.0.0](https://aomediacodec.github.io/av1-rtp-spec/v1.0.0.html).
+  [RFC 9628: RTP Payload Format for AV1](https://datatracker.ietf.org/doc/rfc9628/).
 
   ## Input/Output
 
@@ -12,24 +12,34 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
   ## Features
 
-  - Handles OBU fragmentation via Z/Y bits
-  - Properly handles N bit for coded video sequence boundaries
-  - Assembles complete temporal units when marker bit is set
-  - Adds temporal delimiter OBU to output temporal units
+  - Handles OBU fragmentation via Z/Y bits (RFC 9628 §4.3.2)
+  - Properly handles N bit for coded video sequence boundaries (RFC 9628 §4.4)
+  - Assembles complete temporal units when marker bit is set (RFC 9628 §4.2)
+  - Adds temporal delimiter OBU to output temporal units (AV1 Spec §5.3.1)
   - Caches and manages sequence headers across coded video sequences
   - Handles sequence header changes (resolution/profile changes mid-stream)
+  - Compatible with OBS/SVT-AV1 continuous intra refresh streams
 
-  ## Aggregation Header Format (Section 4.4 of RTP spec)
+  ## Aggregation Header Format (RFC 9628 §4.4)
 
       0 1 2 3 4 5 6 7
       +-+-+-+-+-+-+-+-+
       |Z|Y| W |N|-|-|-|
       +-+-+-+-+-+-+-+-+
 
-  - Z: First OBU element is continuation of previous packet's fragment
-  - Y: Last OBU element will continue in next packet
-  - W: Number of OBU elements (0 = use length fields, 1-3 = count, last has no length)
-  - N: First packet of a coded video sequence (new sequence header expected)
+  - Z: First OBU element is continuation of previous packet's fragment (RFC 9628 §4.3.2)
+  - Y: Last OBU element will continue in next packet (RFC 9628 §4.3.2)
+  - W: Number of OBU elements (0 = use length fields, 1-3 = count, last has no length) (RFC 9628 §4.3)
+  - N: First packet of a coded video sequence (new sequence header expected) (RFC 9628 §4.4)
+
+  ## Telemetry Events
+
+  This module emits the following telemetry events:
+
+  - `[:membrane_rtp_av1, :depayloader, :temporal_unit_emitted]` - Emitted when a temporal unit is output
+  - `[:membrane_rtp_av1, :depayloader, :sequence_header_cached]` - Emitted when sequence header is cached
+  - `[:membrane_rtp_av1, :depayloader, :keyframe_requested]` - Emitted when PLI is sent upstream
+  - `[:membrane_rtp_av1, :depayloader, :fragment_dropped]` - Emitted when fragment is dropped due to packet loss
   """
 
   use Membrane.Filter
@@ -41,6 +51,12 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   alias Membrane.RTP.AV1.ExWebRTC.{LEB128, Payload}
 
   import Bitwise
+
+  # =============================================================================
+  # Telemetry Events
+  # =============================================================================
+
+  @telemetry_prefix [:membrane_rtp_av1, :depayloader]
 
   # =============================================================================
   # OBU Type Constants (AV1 Spec Section 6.2.2)
@@ -284,6 +300,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         - Timestamp: #{timestamp}
         """)
 
+        emit_sequence_header_telemetry(1, byte_size(new_seq_header), :initial)
+
         %{
           state
           | cached_sequence_header: new_seq_header,
@@ -296,19 +314,23 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
       # Sequence header changed (resolution change, profile change, etc.)
       new_seq_header != state.cached_sequence_header ->
+        new_generation = state.sequence_header_generation + 1
+
         Membrane.Logger.debug("""
         Sequence header CHANGED - new coded video sequence
         - Previous size: #{byte_size(state.cached_sequence_header)} bytes
         - New size: #{byte_size(new_seq_header)} bytes
-        - Generation: #{state.sequence_header_generation} -> #{state.sequence_header_generation + 1}
+        - Generation: #{state.sequence_header_generation} -> #{new_generation}
         - Frames since last seq header: #{state.frames_since_sequence_header}
         Note: Decoder may need reinitialization
         """)
 
+        emit_sequence_header_telemetry(new_generation, byte_size(new_seq_header), :changed)
+
         %{
           state
           | cached_sequence_header: new_seq_header,
-            sequence_header_generation: state.sequence_header_generation + 1,
+            sequence_header_generation: new_generation,
             waiting_for_keyframe: false,
             waiting_for_sequence_header: false,
             last_n_bit_timestamp: timestamp,
@@ -331,6 +353,14 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     end
   end
 
+  defp emit_sequence_header_telemetry(generation, size, reason) do
+    :telemetry.execute(
+      @telemetry_prefix ++ [:sequence_header_cached],
+      %{generation: generation, size: size},
+      %{reason: reason}
+    )
+  end
+
   # -----------------------------------------------------------------------------
   # OBU Fragment Handling (Z/Y Bits)
   # -----------------------------------------------------------------------------
@@ -347,6 +377,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
           "Received complete OBU while having incomplete fragment - dropping fragment (likely packet loss)"
         )
 
+        emit_fragment_dropped_telemetry(:incomplete_fragment_replaced, 0, 0)
+
         state
         |> reset_obu_fragment()
         |> append_obus(timestamp, av1_payload.payload, pts)
@@ -360,6 +392,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         Membrane.Logger.debug(
           "Received first OBU fragment while having incomplete fragment - dropping old fragment"
         )
+
+        emit_fragment_dropped_telemetry(:new_fragment_started, 0, 1)
 
         state
         |> reset_obu_fragment()
@@ -380,6 +414,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
           "Received last OBU fragment without matching first fragment - dropping"
         )
 
+        emit_fragment_dropped_telemetry(:no_matching_first, 1, 0)
         reset_obu_fragment(state)
 
       # Z=1, Y=1: Middle fragment of an OBU
@@ -392,8 +427,17 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
           "Received middle OBU fragment without matching first fragment - dropping"
         )
 
+        emit_fragment_dropped_telemetry(:no_matching_first, 1, 1)
         reset_obu_fragment(state)
     end
+  end
+
+  defp emit_fragment_dropped_telemetry(reason, z, y) do
+    :telemetry.execute(
+      @telemetry_prefix ++ [:fragment_dropped],
+      %{count: 1},
+      %{reason: reason, z_bit: z, y_bit: y}
+    )
   end
 
   defp start_obu_fragment(state, timestamp, fragment, pts) do
@@ -546,6 +590,10 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     # Build output with proper sequence header handling
     {buffer_actions, new_state} = build_output_with_sequence_header(temporal_unit, pts, state)
 
+    # Emit telemetry for temporal unit emission
+    analysis = analyze_temporal_unit(temporal_unit)
+    emit_temporal_unit_telemetry(temporal_unit, analysis)
+
     new_state = %{
       new_state
       | stream_format_sent: true,
@@ -553,6 +601,20 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     }
 
     {format_actions ++ buffer_actions, new_state}
+  end
+
+  defp emit_temporal_unit_telemetry(temporal_unit, analysis) do
+    :telemetry.execute(
+      @telemetry_prefix ++ [:temporal_unit_emitted],
+      %{
+        size: byte_size(temporal_unit),
+        has_sequence_header: analysis.sequence_header != nil,
+        has_frame: analysis.has_frame,
+        has_frame_header: analysis.has_frame_header,
+        has_tile_group: analysis.has_tile_group
+      },
+      %{}
+    )
   end
 
   defp build_output_with_sequence_header(temporal_unit, pts, state) do
@@ -581,13 +643,21 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         state
       end
 
+    # Frame data can be either OBU_FRAME or separate OBU_FRAME_HEADER + OBU_TILE_GROUP
+    # OBS/SVT-AV1 may use either format depending on encoding settings
+    has_frame_data =
+      analysis.has_frame or (analysis.has_frame_header and analysis.has_tile_group)
+
     cond do
       # No cached sequence header and we have frame data - can't decode, request keyframe
-      state.cached_sequence_header == nil and analysis.has_frame ->
+      state.cached_sequence_header == nil and has_frame_data ->
         Membrane.Logger.warning("""
         Cannot output frame - no sequence header available
         Requesting keyframe (PLI) via upstream event to get sequence header for decoder initialization
         """)
+
+        # Emit telemetry for keyframe request
+        emit_keyframe_requested_telemetry(:no_sequence_header)
 
         # Send KeyframeRequestEvent to :input pad to propagate UPSTREAM toward the source
         # This will eventually reach RTPSource which sends PLI to the WebRTC peer
@@ -597,7 +667,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       # Have cached sequence header but temporal unit doesn't include one - prepend it
       state.cached_sequence_header != nil and
         analysis.sequence_header == nil and
-          analysis.has_frame ->
+          has_frame_data ->
         output =
           build_complete_temporal_unit(
             state.cached_sequence_header,
@@ -613,6 +683,14 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         buffer = build_buffer(output, pts)
         {[buffer: {:output, buffer}], state}
     end
+  end
+
+  defp emit_keyframe_requested_telemetry(reason) do
+    :telemetry.execute(
+      @telemetry_prefix ++ [:keyframe_requested],
+      %{count: 1},
+      %{reason: reason}
+    )
   end
 
   defp build_buffer(payload, pts) do

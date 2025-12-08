@@ -1,17 +1,45 @@
 defmodule Membrane.RTP.AV1.PayloadFormat do
   @moduledoc """
-  Utilities for AV1 RTP payload formatting.
+  Utilities for AV1 RTP payload formatting according to RFC 9628.
 
-  NOTE: Minimal OBU-aware fragmentation with a simple 1-byte header to indicate:
-  - start/end of fragment groups
-  - whether packet carries fragmented data
-  - number of complete OBUs aggregated in packet
+  This module converts AV1 access units (temporal units) into RTP payloads
+  following [RFC 9628: RTP Payload Format for AV1](https://datatracker.ietf.org/doc/rfc9628/).
+
+  ## Features
+
+  - OBU-aware fragmentation with RFC 9628 compliant header encoding
+  - Aggregation: Multiple small OBUs packed into single packet (W=1-3)
+  - Fragmentation: Large OBUs split across packets with Z/Y bits
+  - W=0 mode support for >3 OBUs per packet (RFC 9628 §4.3)
+  - N bit handling for coded video sequence boundaries (RFC 9628 §4.4)
+  - Compatible with OBS/SVT-AV1 continuous intra refresh streams
+
+  ## Header Format (RFC 9628 §4.4)
+
+      0 1 2 3 4 5 6 7
+      +-+-+-+-+-+-+-+-+
+      |Z|Y| W |N|-|-|-|
+      +-+-+-+-+-+-+-+-+
+
+  - Z: First OBU is continuation (RFC 9628 §4.3.2)
+  - Y: Last OBU continues in next packet (RFC 9628 §4.3.2)
+  - W: OBU element count (RFC 9628 §4.3)
+  - N: New coded video sequence (RFC 9628 §4.4)
+
+  ## Telemetry Events
+
+  - `[:membrane_rtp_av1, :payloader, :access_unit_payloaded]` - Payloading complete
+  - `[:membrane_rtp_av1, :payloader, :obu_fragmented]` - OBU fragmented across packets
+  - `[:membrane_rtp_av1, :payloader, :w0_fallback]` - Using W=0 mode (>3 OBUs)
   """
 
   @type payload :: binary()
 
   @default_mtu 1200
   @header_size 1
+
+  # Telemetry event prefix for payloader metrics
+  @telemetry_prefix [:membrane_rtp_av1, :payloader]
 
   alias Membrane.RTP.AV1.{
     OBU,
@@ -112,13 +140,16 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     # as the decoder can start decoding from any such frame.
     is_keyframe = SequenceDetector.is_new_coded_video_sequence?(access_unit)
 
-    # Debug logging for keyframe detection
+    # Debug logging for keyframe detection with OBS/SVT-AV1 context
     require Logger
 
     if is_keyframe do
-      Logger.info(
-        "🔑 AV1 Payloader: New coded video sequence (has sequence header) - setting N=1 bit"
-      )
+      Logger.info("""
+      AV1 Payloader: New coded video sequence detected
+      - Setting N=1 bit (RFC 9628 §4.4)
+      - Access unit size: #{byte_size(access_unit)} bytes
+      - Note: OBS/SVT-AV1 continuous intra refresh may set N=1 on every frame with sequence header
+      """)
     end
 
     # Try to split OBUs - first Low Overhead format (from depayloader),
@@ -199,7 +230,22 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     # Emit telemetry for aggregation metrics
     emit_aggregation_telemetry(obus, packets, max_payload)
 
+    # Emit telemetry for packet creation
+    emit_packet_creation_telemetry(packets, length(obus), is_keyframe)
+
     packets
+  end
+
+  defp emit_packet_creation_telemetry(packets, obu_count, is_keyframe) do
+    :telemetry.execute(
+      @telemetry_prefix ++ [:access_unit_payloaded],
+      %{
+        packet_count: length(packets),
+        obu_count: obu_count,
+        is_keyframe: is_keyframe
+      },
+      %{}
+    )
   end
 
   defp emit_aggregation_telemetry(obus, _packets, max_payload) do
@@ -259,9 +305,18 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     if count == 0 do
       acc
     else
+      # Calculate W value for header and payload building
+      # W=0 when count > 3, W=count when count in 1..3
+      w_value = if count > 3, do: 0, else: count
+
+      # Emit telemetry for W=0 fallback (unusual case with >3 OBUs)
+      if w_value == 0 do
+        emit_w0_fallback_telemetry(count)
+      end
+
       # Build packet payload from RTP-formatted OBUs
-      # All but last OBU get LEB128 length prefix per RFC 9420
-      payload = build_aggregated_payload(Enum.reverse(rtp_obus))
+      # Pass W value to correctly handle W=0 case (all OBUs get LEB128 prefix)
+      payload = build_aggregated_payload(Enum.reverse(rtp_obus), w_value)
       # N bit: set only on first packet if this is a TRUE keyframe
       n_bit = is_keyframe and is_first_packet
 
@@ -271,6 +326,14 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
       pkt = [header | payload]
       [pkt | acc]
     end
+  end
+
+  defp emit_w0_fallback_telemetry(obu_count) do
+    :telemetry.execute(
+      @telemetry_prefix ++ [:w0_fallback],
+      %{obu_count: obu_count},
+      %{reason: :exceeded_w_field_max}
+    )
   end
 
   defp do_fragment_obus(
@@ -390,9 +453,11 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
               )
             else
               # Not enough space or OBU fits in single packet - use original flush logic
-              # Build payload: all but last get LEB128 prefix
-              payload = build_aggregated_payload(Enum.reverse(rtp_obus))
               count = current_count
+              # Calculate W value for header and payload building
+              w_value = if count > 3, do: 0, else: count
+              # Build payload with correct W mode
+              payload = build_aggregated_payload(Enum.reverse(rtp_obus), w_value)
               n_bit = is_keyframe and is_first_packet
 
               header =
@@ -467,11 +532,23 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
     end
   end
 
-  # Build aggregated payload: all but last OBU get LEB128 length prefix
-  defp build_aggregated_payload([]), do: <<>>
-  defp build_aggregated_payload([single]), do: single
+  # Build aggregated payload based on W value
+  # W=0: All OBUs get LEB128 length prefix (RFC 9628 §4.3)
+  # W>0: All but last OBU get LEB128 length prefix, last extends to packet end
+  defp build_aggregated_payload(rtp_obus, w_value \\ nil)
+  defp build_aggregated_payload([], _w_value), do: <<>>
+  defp build_aggregated_payload([single], 0), do: OBU.leb128_encode(byte_size(single)) <> single
+  defp build_aggregated_payload([single], _w_value), do: single
 
-  defp build_aggregated_payload(rtp_obus) do
+  defp build_aggregated_payload(rtp_obus, 0) do
+    # W=0: ALL OBUs get LEB128 prefix (RFC 9628 §4.3)
+    rtp_obus
+    |> Enum.map(fn obu -> OBU.leb128_encode(byte_size(obu)) <> obu end)
+    |> IO.iodata_to_binary()
+  end
+
+  defp build_aggregated_payload(rtp_obus, _w_value) do
+    # W>0: All but last get prefix, last extends to end of packet
     {all_but_last, [last]} = Enum.split(rtp_obus, length(rtp_obus) - 1)
 
     prefixed =
@@ -507,7 +584,18 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
         is_first_packet
       )
 
+    # Emit telemetry for fragmented OBU
+    emit_fragment_created_telemetry(total, length(packets))
+
     Enum.reduce(packets, acc, fn pkt, a -> [pkt | a] end)
+  end
+
+  defp emit_fragment_created_telemetry(obu_size, fragment_count) do
+    :telemetry.execute(
+      @telemetry_prefix ++ [:obu_fragmented],
+      %{obu_size: obu_size, fragment_count: fragment_count},
+      %{}
+    )
   end
 
   # Updated to avoid intermediate binary creation by using offset into original OBU
