@@ -132,58 +132,6 @@ defmodule Membrane.RTP.AV1.FrameHeaderTest do
     end
   end
 
-  describe "displayable?/1" do
-    test "frame with show_frame=1 is displayable" do
-      header = %FrameHeader{
-        frame_type: :inter_frame,
-        show_frame: true,
-        show_existing_frame: false
-      }
-
-      assert FrameHeader.displayable?(header) == true
-    end
-
-    test "frame with show_existing_frame=1 is displayable" do
-      header = %FrameHeader{
-        frame_type: :inter_frame,
-        show_frame: false,
-        show_existing_frame: true
-      }
-
-      assert FrameHeader.displayable?(header) == true
-    end
-
-    test "frame with both show flags is displayable" do
-      # This shouldn't happen in practice, but test boundary
-      header = %FrameHeader{
-        frame_type: :inter_frame,
-        show_frame: true,
-        show_existing_frame: true
-      }
-
-      assert FrameHeader.displayable?(header) == true
-    end
-
-    test "frame with show_frame=0 and show_existing_frame=0 is not displayable" do
-      header = %FrameHeader{
-        frame_type: :inter_frame,
-        show_frame: false,
-        show_existing_frame: false
-      }
-
-      assert FrameHeader.displayable?(header) == false
-    end
-  end
-
-  describe "frame_type_name/1" do
-    test "returns human-readable names for frame types" do
-      assert FrameHeader.frame_type_name(:key_frame) == "KEY_FRAME"
-      assert FrameHeader.frame_type_name(:inter_frame) == "INTER_FRAME"
-      assert FrameHeader.frame_type_name(:intra_only_frame) == "INTRA_ONLY_FRAME"
-      assert FrameHeader.frame_type_name(:switch_frame) == "SWITCH_FRAME"
-    end
-  end
-
   describe "integration with real-world patterns" do
     test "typical video sequence: KEY + multiple INTER frames" do
       # KEY_FRAME
@@ -227,7 +175,6 @@ defmodule Membrane.RTP.AV1.FrameHeaderTest do
       assert {:ok, b_header} = FrameHeader.parse_minimal(b_frame_data)
       assert b_header.frame_type == :inter_frame
       assert b_header.show_frame == false
-      assert FrameHeader.displayable?(b_header) == false
       assert FrameHeader.starts_temporal_unit?(b_header) == false
     end
 

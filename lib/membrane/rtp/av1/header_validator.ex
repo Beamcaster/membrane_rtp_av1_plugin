@@ -19,7 +19,6 @@ defmodule Membrane.RTP.AV1.HeaderValidator do
            | :invalid_c_value
            | :invalid_temporal_id
            | :invalid_spatial_id
-           | :reserved_ids_bits_set
            | :z_set_without_ss
            | :m_set_without_ids}
 
@@ -61,33 +60,6 @@ defmodule Membrane.RTP.AV1.HeaderValidator do
            :ok <- validate_c_value(c) do
         :ok
       end
-    end
-  end
-
-  @doc """
-  Validates the IDS byte (byte 1 when M=1).
-  Checks that reserved bits are 0 and fields are in valid ranges.
-  """
-  @spec validate_ids_byte(byte()) :: :ok | validation_error()
-  def validate_ids_byte(b1) when is_integer(b1) and b1 >= 0 and b1 <= 255 do
-    import Bitwise
-
-    t = (b1 &&& 0b1110_0000) >>> 5
-    l = (b1 &&& 0b0001_1000) >>> 3
-    reserved = b1 &&& 0b0000_0111
-
-    cond do
-      reserved != 0 ->
-        {:error, :reserved_ids_bits_set}
-
-      t > 7 ->
-        {:error, :invalid_temporal_id}
-
-      l > 3 ->
-        {:error, :invalid_spatial_id}
-
-      true ->
-        :ok
     end
   end
 
@@ -175,10 +147,6 @@ defmodule Membrane.RTP.AV1.HeaderValidator do
 
   def error_message({:error, :invalid_spatial_id}) do
     "Spatial ID must be 0-3"
-  end
-
-  def error_message({:error, :reserved_ids_bits_set}) do
-    "Reserved bits in IDS byte (bits 0-2) must be 0"
   end
 
   def error_message({:error, :z_set_without_ss}) do

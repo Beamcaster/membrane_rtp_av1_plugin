@@ -27,7 +27,7 @@ defmodule Membrane.RTP.AV1.SpecHeader do
     zbit = if z, do: 1, else: 0
     ybit = if y, do: 1, else: 0
     nbit = if n, do: 1, else: 0
-    <<(zbit <<< 7) ||| (ybit <<< 6) ||| (w <<< 4) ||| (nbit <<< 3) ||| c>>
+    <<zbit <<< 7 ||| ybit <<< 6 ||| w <<< 4 ||| nbit <<< 3 ||| c>>
   end
 
   @spec decode(binary()) :: {:ok, t(), binary()} | :error

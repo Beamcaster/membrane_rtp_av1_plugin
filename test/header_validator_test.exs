@@ -67,50 +67,6 @@ defmodule Membrane.RTP.AV1.HeaderValidatorTest do
     end
   end
 
-  describe "validate_ids_byte/1" do
-    test "accepts valid IDS byte with all fields in range" do
-      # T=3, L=1, reserved=000
-      b1 = 0b0110_1000
-      assert :ok = HeaderValidator.validate_ids_byte(b1)
-    end
-
-    test "accepts IDS byte with max valid values" do
-      # T=7, L=3, reserved=000
-      b1 = 0b1111_1000
-      assert :ok = HeaderValidator.validate_ids_byte(b1)
-    end
-
-    test "accepts IDS byte with min valid values" do
-      # T=0, L=0, reserved=000
-      b1 = 0b0000_0000
-      assert :ok = HeaderValidator.validate_ids_byte(b1)
-    end
-
-    test "rejects IDS byte with reserved bit 0 set" do
-      # T=0, L=0, reserved=001
-      b1 = 0b0000_0001
-      assert {:error, :reserved_ids_bits_set} = HeaderValidator.validate_ids_byte(b1)
-    end
-
-    test "rejects IDS byte with reserved bit 1 set" do
-      # T=0, L=0, reserved=010
-      b1 = 0b0000_0010
-      assert {:error, :reserved_ids_bits_set} = HeaderValidator.validate_ids_byte(b1)
-    end
-
-    test "rejects IDS byte with reserved bit 2 set" do
-      # T=0, L=0, reserved=100
-      b1 = 0b0000_0100
-      assert {:error, :reserved_ids_bits_set} = HeaderValidator.validate_ids_byte(b1)
-    end
-
-    test "rejects IDS byte with all reserved bits set" do
-      # T=0, L=0, reserved=111
-      b1 = 0b0000_0111
-      assert {:error, :reserved_ids_bits_set} = HeaderValidator.validate_ids_byte(b1)
-    end
-  end
-
   describe "validate_for_encode/1" do
     test "accepts valid header without fragmentation" do
       header = %FullHeader{
@@ -295,7 +251,6 @@ defmodule Membrane.RTP.AV1.HeaderValidatorTest do
         :invalid_c_value,
         :invalid_temporal_id,
         :invalid_spatial_id,
-        :reserved_ids_bits_set,
         :z_set_without_ss,
         :m_set_without_ids
       ]

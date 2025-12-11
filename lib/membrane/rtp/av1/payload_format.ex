@@ -309,11 +309,6 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
       # W=0 when count > 3, W=count when count in 1..3
       w_value = if count > 3, do: 0, else: count
 
-      # Emit telemetry for W=0 fallback (unusual case with >3 OBUs)
-      if w_value == 0 do
-        emit_w0_fallback_telemetry(count)
-      end
-
       # Build packet payload from RTP-formatted OBUs
       # Pass W value to correctly handle W=0 case (all OBUs get LEB128 prefix)
       payload = build_aggregated_payload(Enum.reverse(rtp_obus), w_value)
@@ -323,17 +318,8 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
       header =
         encode_header(false, true, false, count, raw_obus_in_group, header_mode, fmtp, n_bit)
 
-      pkt = [header | payload]
-      [pkt | acc]
+      [[header | payload] | acc]
     end
-  end
-
-  defp emit_w0_fallback_telemetry(obu_count) do
-    :telemetry.execute(
-      @telemetry_prefix ++ [:w0_fallback],
-      %{obu_count: obu_count},
-      %{reason: :exceeded_w_field_max}
-    )
   end
 
   defp do_fragment_obus(
@@ -535,7 +521,7 @@ defmodule Membrane.RTP.AV1.PayloadFormat do
   # Build aggregated payload based on W value
   # W=0: All OBUs get LEB128 length prefix (RFC 9628 §4.3)
   # W>0: All but last OBU get LEB128 length prefix, last extends to packet end
-  defp build_aggregated_payload(rtp_obus, w_value \\ nil)
+  defp build_aggregated_payload(rtp_obus, w_value)
   defp build_aggregated_payload([], _w_value), do: <<>>
   defp build_aggregated_payload([single], 0), do: OBU.leb128_encode(byte_size(single)) <> single
   defp build_aggregated_payload([single], _w_value), do: single

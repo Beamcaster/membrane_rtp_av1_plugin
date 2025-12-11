@@ -240,7 +240,6 @@ defmodule Membrane.RTP.AV1.Rav1DepayloaderTest do
       assert Enum.empty?(state2.fragment_queue)
       assert Enum.empty?(state2.complete_obu_queue)
     end
-
   end
 
   describe "sequence number handling" do

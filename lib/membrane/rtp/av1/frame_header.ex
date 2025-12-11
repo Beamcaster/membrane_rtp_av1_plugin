@@ -155,50 +155,6 @@ defmodule Membrane.RTP.AV1.FrameHeader do
 
   def starts_temporal_unit?(_), do: false
 
-  @doc """
-  Determine if this frame is displayable (contributes to output).
-
-  Frames with show_frame=1 or show_existing_frame=1 are displayable.
-
-  ## Examples
-
-      iex> FrameHeader.displayable?(%FrameHeader{show_frame: true})
-      true
-
-      iex> FrameHeader.displayable?(%FrameHeader{show_existing_frame: true})
-      true
-
-      iex> FrameHeader.displayable?(%FrameHeader{show_frame: false, show_existing_frame: false})
-      false
-  """
-  @spec displayable?(t()) :: boolean()
-  def displayable?(%__MODULE__{show_frame: true}), do: true
-  def displayable?(%__MODULE__{show_existing_frame: true}), do: true
-  def displayable?(_), do: false
-
-  @doc """
-  Get human-readable name for frame type.
-
-  ## Examples
-
-      iex> FrameHeader.frame_type_name(:key_frame)
-      "KEY_FRAME"
-
-      iex> FrameHeader.frame_type_name(:inter_frame)
-      "INTER_FRAME"
-
-      iex> FrameHeader.frame_type_name(:intra_only_frame)
-      "INTRA_ONLY_FRAME"
-
-      iex> FrameHeader.frame_type_name(:switch_frame)
-      "SWITCH_FRAME"
-  """
-  @spec frame_type_name(frame_type()) :: String.t()
-  def frame_type_name(:key_frame), do: "KEY_FRAME"
-  def frame_type_name(:inter_frame), do: "INTER_FRAME"
-  def frame_type_name(:intra_only_frame), do: "INTRA_ONLY_FRAME"
-  def frame_type_name(:switch_frame), do: "SWITCH_FRAME"
-
   # Private functions
 
   defp parse_bitstream(<<data::bitstring>>) do

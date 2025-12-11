@@ -89,7 +89,12 @@ defmodule Membrane.RTP.AV1.Rav1Depayloader.Reorder do
   defp ensure_meta(r, _now, _pts), do: r
 
   # Put packet (ignore duplicates)
-  defp put_packet(%__MODULE__{packets: pkts, min_seq: nil, max_seq: nil} = r, seq, payload, marker) do
+  defp put_packet(
+         %__MODULE__{packets: pkts, min_seq: nil, max_seq: nil} = r,
+         seq,
+         payload,
+         marker
+       ) do
     pkts2 = Map.put_new(pkts, seq, payload)
 
     %__MODULE__{
@@ -101,7 +106,12 @@ defmodule Membrane.RTP.AV1.Rav1Depayloader.Reorder do
     }
   end
 
-  defp put_packet(%__MODULE__{packets: pkts, min_seq: min, max_seq: max} = r, seq, payload, marker) do
+  defp put_packet(
+         %__MODULE__{packets: pkts, min_seq: min, max_seq: max} = r,
+         seq,
+         payload,
+         marker
+       ) do
     if Map.has_key?(pkts, seq) do
       %__MODULE__{r | marker_seen: marker || r.marker_seen}
     else
