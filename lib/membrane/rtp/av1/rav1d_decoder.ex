@@ -45,6 +45,11 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
       spec: pos_integer(),
       default: 90_000,
       description: "RTP clock rate in Hz for PTS conversion (default: 90000 for video)"
+    ],
+    framerate: [
+      spec: {pos_integer(), pos_integer()},
+      default: {30, 1},
+      description: "Video framerate as {numerator, denominator} tuple (e.g., {30, 1} for 30fps)"
     ]
   )
 
@@ -55,6 +60,7 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
         state = %{
           decoder: decoder,
           clock_rate: opts.clock_rate,
+          framerate: opts.framerate,
           stream_format_sent: false,
           frame_count: 0
         }
@@ -106,8 +112,12 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
   end
 
   defp process_decoded_frames(frames, pts, state) do
-    {actions, new_state} =
-      Enum.reduce(frames, {[], state}, fn frame, {acc_actions, acc_state} ->
+    # Calculate frame duration from framerate
+    {fps_num, fps_den} = state.framerate
+    frame_duration = div(Membrane.Time.seconds(1) * fps_den, fps_num)
+
+    {actions, new_state, _} =
+      Enum.reduce(frames, {[], state, 0}, fn frame, {acc_actions, acc_state, frame_idx} ->
         # Send stream format on first frame
         {format_actions, format_state} =
           if not acc_state.stream_format_sent do
@@ -116,14 +126,16 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
             {[], acc_state}
           end
 
-        # Create output buffer
-        frame_buffer = create_frame_buffer(frame, pts, format_state)
+        # Create output buffer with sequential PTS
+        # Each frame in the batch gets an incremented timestamp
+        frame_pts = pts + frame_idx * frame_duration
+        frame_buffer = create_frame_buffer(frame, frame_pts, format_state)
 
         # Combine actions
         new_actions = acc_actions ++ format_actions ++ [buffer: {:output, frame_buffer}]
         new_state = %{format_state | frame_count: format_state.frame_count + 1}
 
-        {new_actions, new_state}
+        {new_actions, new_state, frame_idx + 1}
       end)
 
     {actions, new_state}
@@ -135,7 +147,7 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
       height: frame.height,
       pixel_format: :I420,
       aligned: true,
-      framerate: 30
+      framerate: state.framerate
     }
 
     Membrane.Logger.info(
@@ -152,19 +164,10 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
     # Combine YUV planes into single buffer (I420 format: Y, then U, then V)
     yuv_data = frame.y_plane <> frame.u_plane <> frame.v_plane
 
-    # Use frame timestamp if available, otherwise use buffer PTS
-    output_pts =
-      if frame.timestamp != 0 do
-        frame.timestamp
-        |> div(state.clock_rate)
-        |> Membrane.Time.seconds()
-      else
-        pts
-      end
-
+    # Use the provided PTS directly (already calculated with sequential offsets)
     %Buffer{
       payload: yuv_data,
-      pts: output_pts,
+      pts: pts,
       metadata: %{
         width: frame.width,
         height: frame.height,
