@@ -207,9 +207,9 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # Debug Logging
   # =============================================================================
 
-  defp log_packet_debug(state, av1_payload, raw_obus, timestamp, marker) do
-    # Use extracted raw_obus (with LEB128 prefixes stripped) for accurate OBU type detection
-    obu_types = list_obu_types(raw_obus)
+  defp log_packet_debug(state, av1_payload, extracted_obus, timestamp, marker) do
+    # Use extracted OBUs for accurate OBU type detection
+    obu_types = list_obu_types(extracted_obus)
 
     Membrane.Logger.debug("""
     RTP packet received:
@@ -223,12 +223,19 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     """)
   end
 
-  defp list_obu_types(data) do
-    iterate_obus(data, [], fn obu_type, acc ->
-      [obu_type_name(obu_type) | acc]
-    end)
-    |> Enum.reverse()
+  # List OBU types from extracted OBUs (either list or fragment)
+  defp list_obu_types({:obus, obu_list}) do
+    Enum.map(obu_list, &get_obu_type_from_binary/1)
+    |> Enum.map(&obu_type_name/1)
   end
+
+  defp list_obu_types({:fragment, _binary}) do
+    ["FRAGMENT"]
+  end
+
+  # Get OBU type from first byte of OBU binary
+  defp get_obu_type_from_binary(<<_forbidden::1, obu_type::4, _rest::3, _::binary>>), do: obu_type
+  defp get_obu_type_from_binary(_), do: -1
 
   defp obu_type_name(@obu_sequence_header), do: "SEQUENCE_HEADER"
   defp obu_type_name(@obu_temporal_delimiter), do: "TEMPORAL_DELIMITER"
@@ -274,6 +281,10 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # -----------------------------------------------------------------------------
 
   # Extract individual OBUs from RTP payload based on W field
+  # Returns:
+  #   {:obus, [obu1, obu2, ...]} - Complete OBUs as a list (boundaries preserved)
+  #   {:fragment, binary} - Fragment data (partial OBU)
+  #
   # W=0: All OBUs have LEB128 length prefix
   # W=1-3: That many OBUs, all but last have LEB128 length prefix
   defp extract_obus_from_rtp_payload(%{w: w, z: z, y: y, payload: payload}) do
@@ -281,25 +292,23 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       # For fragments (Z=1 or Y=1), payload is raw OBU data (possibly partial)
       # No LEB128 prefixes in fragment payloads
       z == 1 or y == 1 ->
-        payload
+        {:fragment, payload}
 
       # W=0: Length-prefixed format - all OBUs have LEB128 prefix
       w == 0 ->
-        extract_length_prefixed_obus(payload, [])
-        |> IO.iodata_to_binary()
+        {:obus, extract_length_prefixed_obus(payload, [])}
 
       # W=1: Single OBU, no length prefix (extends to end of packet)
       w == 1 ->
-        payload
+        {:obus, [payload]}
 
       # W=2-3: Multiple OBUs, all but last have LEB128 prefix
       w in 2..3 ->
-        extract_w_obus(payload, w, [])
-        |> IO.iodata_to_binary()
+        {:obus, extract_w_obus(payload, w, [])}
 
       true ->
-        # Fallback: treat as raw data
-        payload
+        # Fallback: treat as single OBU
+        {:obus, [payload]}
     end
   end
 
@@ -359,14 +368,21 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # N Bit Handling (Coded Video Sequence Boundaries)
   # -----------------------------------------------------------------------------
 
-  defp handle_n_bit(state, %{n: 1}, raw_obus, timestamp) do
+  defp handle_n_bit(state, %{n: 1}, extracted_obus, timestamp) do
     # N=1 indicates first packet of a new coded video sequence
     # Per spec: "MUST be set to 1 if the packet is the first packet of a coded video sequence"
     # A sequence header SHOULD be present in this temporal unit
 
     Membrane.Logger.debug("N=1: New coded video sequence starting at timestamp #{timestamp}")
 
-    case extract_sequence_header(raw_obus) do
+    # Extract sequence header based on format
+    seq_header =
+      case extracted_obus do
+        {:obus, obu_list} -> find_sequence_header_in_list(obu_list)
+        {:fragment, _binary} -> nil
+      end
+
+    case seq_header do
       nil ->
         # Sequence header not in this packet - might be in next packet of same TU
         # Or encoder might be sending it separately (less common)
@@ -381,7 +397,22 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     end
   end
 
-  defp handle_n_bit(state, _av1_payload, _raw_obus, _timestamp), do: state
+  defp handle_n_bit(state, _av1_payload, _extracted_obus, _timestamp), do: state
+
+  # Find sequence header in list of OBUs by checking OBU type byte
+  # OBU header: 0|type(4)|extension(1)|has_size(1)|reserved(1)
+  # Sequence header type = 1
+  defp find_sequence_header_in_list([]), do: nil
+
+  defp find_sequence_header_in_list([obu | rest]) do
+    case obu do
+      <<_forbidden::1, @obu_sequence_header::4, _rest_bits::3, _::binary>> ->
+        obu
+
+      _ ->
+        find_sequence_header_in_list(rest)
+    end
+  end
 
   defp handle_sequence_header_received(state, new_seq_header, timestamp) do
     cond do
@@ -458,12 +489,12 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # OBU Fragment Handling (Z/Y Bits)
   # -----------------------------------------------------------------------------
 
-  # raw_obus: Already extracted OBU data with LEB128 prefixes stripped (based on W field)
-  defp handle_obu_fragments(state, av1_payload, raw_obus, timestamp, pts) do
+  # extracted_obus: Either {:obus, [list]} or {:fragment, binary}
+  defp handle_obu_fragments(state, av1_payload, extracted_obus, timestamp, pts) do
     case {av1_payload.z, av1_payload.y, state.current_obu_fragment} do
       # Z=0, Y=0: Single complete OBU (or multiple complete OBUs)
       {0, 0, nil} ->
-        append_obus(state, timestamp, raw_obus, pts)
+        append_obus(state, timestamp, extracted_obus, pts)
 
       # Z=0, Y=0: Complete OBU but we have leftover fragment (packet loss case)
       {0, 0, _fragment} ->
@@ -475,12 +506,13 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
         state
         |> reset_obu_fragment()
-        |> append_obus(timestamp, raw_obus, pts)
+        |> append_obus(timestamp, extracted_obus, pts)
 
       # Z=0, Y=1: First fragment of an OBU
-      # For fragments, raw_obus is just the raw payload (no LEB128 stripping needed)
+      # For fragments, extracted_obus is {:fragment, binary}
       {0, 1, nil} ->
-        start_obu_fragment(state, timestamp, raw_obus, pts)
+        {:fragment, fragment_data} = extracted_obus
+        start_obu_fragment(state, timestamp, fragment_data, pts)
 
       # Z=0, Y=1: First fragment but we already have one (packet loss case)
       {0, 1, _fragment} ->
@@ -489,19 +521,22 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         )
 
         emit_fragment_dropped_telemetry(:new_fragment_started, 0, 1)
+        {:fragment, fragment_data} = extracted_obus
 
         state
         |> reset_obu_fragment()
-        |> start_obu_fragment(timestamp, raw_obus, pts)
+        |> start_obu_fragment(timestamp, fragment_data, pts)
 
       # Z=1, Y=0: Last fragment of an OBU
       {1, 0, fragment} when fragment != nil and timestamp == state.current_timestamp ->
-        complete_obu = fragment <> raw_obus
+        {:fragment, fragment_data} = extracted_obus
+        complete_obu = fragment <> fragment_data
 
         state
         |> reset_obu_fragment()
         # Use existing current_pts since this is a continuation (not first packet)
-        |> append_obus(timestamp, complete_obu, state.current_pts)
+        # Wrap in list for append_obus
+        |> append_obus(timestamp, {:obus, [complete_obu]}, state.current_pts)
 
       # Z=1, Y=0: Last fragment but no matching first fragment
       {1, 0, _} ->
@@ -514,7 +549,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
       # Z=1, Y=1: Middle fragment of an OBU
       {1, 1, fragment} when fragment != nil and timestamp == state.current_timestamp ->
-        %{state | current_obu_fragment: fragment <> raw_obus}
+        {:fragment, fragment_data} = extracted_obus
+        %{state | current_obu_fragment: fragment <> fragment_data}
 
       # Z=1, Y=1: Middle fragment but no matching first fragment
       {1, 1, _} ->
@@ -564,16 +600,20 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # OBU Accumulation
   # -----------------------------------------------------------------------------
 
-  defp append_obus(state, timestamp, obu_data, pts) do
+  # Handle {:obus, list} format - filter and concatenate
+  defp append_obus(state, timestamp, {:obus, obu_list}, pts) do
     # Strip temporal delimiters - we add a canonical one at output
     # Also strip tile list OBUs per spec: "SHOULD be removed when transmitted"
-    filtered_data = strip_unwanted_obus(obu_data)
+    filtered_list = strip_unwanted_obus_from_list(obu_list)
 
-    if filtered_data == <<>> do
+    if filtered_list == [] do
       state
     else
+      # Concatenate filtered OBUs into binary
+      filtered_data = IO.iodata_to_binary(filtered_list)
+
       # Check for sequence header in the OBUs (may arrive without N=1 in some edge cases)
-      state = maybe_cache_sequence_header_opportunistic(state, filtered_data, timestamp)
+      state = maybe_cache_sequence_header_opportunistic(state, filtered_list, timestamp)
 
       cond do
         # Starting new temporal unit - capture PTS from first packet
@@ -607,11 +647,25 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     end
   end
 
+  # Filter unwanted OBUs from list by checking type byte
+  defp strip_unwanted_obus_from_list(obu_list) do
+    Enum.reject(obu_list, fn obu ->
+      case obu do
+        <<_forbidden::1, obu_type::4, _rest::3, _::binary>> ->
+          obu_type in [@obu_temporal_delimiter, @obu_tile_list]
+
+        _ ->
+          false
+      end
+    end)
+  end
+
   # Opportunistically cache sequence header even if N bit wasn't set
   # This handles edge cases where sequence header arrives mid-stream
-  defp maybe_cache_sequence_header_opportunistic(state, obu_data, timestamp) do
+  # Accepts list of OBUs
+  defp maybe_cache_sequence_header_opportunistic(state, obu_list, timestamp) when is_list(obu_list) do
     if state.require_sequence_header do
-      case extract_sequence_header(obu_data) do
+      case find_sequence_header_in_list(obu_list) do
         nil ->
           state
 
