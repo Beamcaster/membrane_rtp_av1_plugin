@@ -223,7 +223,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     """)
   end
 
-  # List OBU types from extracted OBUs (either list or fragment)
+  # List OBU types from extracted OBUs (either list, fragment, or both)
   defp list_obu_types({:obus, obu_list}) do
     Enum.map(obu_list, &get_obu_type_from_binary/1)
     |> Enum.map(&obu_type_name/1)
@@ -231,6 +231,14 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
   defp list_obu_types({:fragment, _binary}) do
     ["FRAGMENT"]
+  end
+
+  defp list_obu_types({:obus_and_fragment, obu_list, _fragment}) do
+    obu_types =
+      Enum.map(obu_list, &get_obu_type_from_binary/1)
+      |> Enum.map(&obu_type_name/1)
+
+    obu_types ++ ["FRAGMENT"]
   end
 
   # Get OBU type from first byte of OBU binary
@@ -283,17 +291,29 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # Extract individual OBUs from RTP payload based on W field
   # Returns:
   #   {:obus, [obu1, obu2, ...]} - Complete OBUs as a list (boundaries preserved)
-  #   {:fragment, binary} - Fragment data (partial OBU)
+  #   {:fragment, binary} - Fragment data (partial OBU, Z=1 continuation)
+  #   {:obus_and_fragment, [complete_obus], fragment} - Complete OBUs followed by trailing fragment (Y=1)
   #
   # W=0: All OBUs have LEB128 length prefix
   # W=1-3: That many OBUs, all but last have LEB128 length prefix
+  #
+  # RFC 9628 §4.3.2:
+  # - Z=1: First OBU element is continuation of previous packet's fragment
+  # - Y=1: Last OBU element will continue in next packet
+  # When Y=1, there may be complete OBUs BEFORE the trailing fragment!
   defp extract_obus_from_rtp_payload(%{w: w, z: z, y: y, payload: payload}) do
     cond do
-      # For fragments (Z=1 or Y=1), payload is raw OBU data (possibly partial)
-      # No LEB128 prefixes in fragment payloads
-      z == 1 or y == 1 ->
+      # Z=1: This packet starts with a continuation fragment
+      # The entire payload (or first OBU element) is fragment data
+      z == 1 ->
         {:fragment, payload}
 
+      # Y=1, Z=0: Last OBU continues in next packet, but preceding OBUs are complete
+      # We need to extract complete OBUs and identify the trailing fragment
+      y == 1 and z == 0 ->
+        extract_obus_with_trailing_fragment(payload, w)
+
+      # Z=0, Y=0: All OBUs are complete
       # W=0: Length-prefixed format - all OBUs have LEB128 prefix
       w == 0 ->
         {:obus, extract_length_prefixed_obus(payload, [])}
@@ -309,6 +329,112 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       true ->
         # Fallback: treat as single OBU
         {:obus, [payload]}
+    end
+  end
+
+  # Extract complete OBUs when Y=1 (last OBU is a fragment)
+  # Returns {:obus_and_fragment, [complete_obus], fragment} or {:fragment, binary}
+  defp extract_obus_with_trailing_fragment(payload, w) do
+    case w do
+      # W=0: All OBUs have LEB128 prefix, extract complete ones
+      0 ->
+        extract_length_prefixed_obus_with_fragment(payload)
+
+      # W=1: Single OBU that's a fragment (no complete OBUs)
+      1 ->
+        {:fragment, payload}
+
+      # W=2-3: W OBUs total, first W-1 have LEB128 prefix and are complete
+      # Last one (no prefix, extends to end) is fragment
+      w when w in 2..3 ->
+        extract_w_obus_with_fragment(payload, w)
+
+      _ ->
+        {:fragment, payload}
+    end
+  end
+
+  # Extract OBUs in W=0 format when Y=1
+  # All complete OBUs have LEB128 prefix, last partial one may not
+  defp extract_length_prefixed_obus_with_fragment(payload) do
+    {complete_obus, remaining} = extract_complete_length_prefixed_obus(payload, [])
+
+    case {complete_obus, remaining} do
+      # No complete OBUs, entire payload is fragment
+      {[], _} ->
+        {:fragment, payload}
+
+      # Have complete OBUs and remaining fragment
+      {obus, <<>>} ->
+        # Edge case: no remaining data (shouldn't happen with Y=1 but handle gracefully)
+        {:obus, obus}
+
+      {obus, fragment} ->
+        {:obus_and_fragment, obus, fragment}
+    end
+  end
+
+  # Extract complete OBUs until we can't read another complete one
+  # Returns {[complete_obus], remaining_binary}
+  defp extract_complete_length_prefixed_obus(<<>>, acc), do: {Enum.reverse(acc), <<>>}
+
+  defp extract_complete_length_prefixed_obus(data, acc) do
+    case LEB128.read(data) do
+      {:ok, leb_size, obu_length} ->
+        <<_leb::binary-size(leb_size), rest::binary>> = data
+
+        if obu_length <= byte_size(rest) do
+          # Complete OBU - extract and continue
+          <<obu::binary-size(obu_length), remaining::binary>> = rest
+          extract_complete_length_prefixed_obus(remaining, [obu | acc])
+        else
+          # Incomplete OBU - this is the fragment
+          # Return accumulated OBUs and the remaining data (including the LEB128 we just read)
+          {Enum.reverse(acc), data}
+        end
+
+      {:error, _} ->
+        # Can't parse LEB128 - remaining data is fragment
+        {Enum.reverse(acc), data}
+    end
+  end
+
+  # Extract OBUs in W=2-3 format when Y=1
+  # First W-1 OBUs have LEB128 prefix and are complete, last one is fragment
+  defp extract_w_obus_with_fragment(payload, w) do
+    {complete_obus, remaining} = extract_w_complete_obus(payload, w - 1, [])
+
+    case {complete_obus, remaining} do
+      {[], _} ->
+        {:fragment, payload}
+
+      {obus, <<>>} ->
+        {:obus, obus}
+
+      {obus, fragment} ->
+        {:obus_and_fragment, obus, fragment}
+    end
+  end
+
+  # Extract exactly count complete OBUs with LEB128 prefix
+  defp extract_w_complete_obus(data, 0, acc), do: {Enum.reverse(acc), data}
+  defp extract_w_complete_obus(<<>>, _count, acc), do: {Enum.reverse(acc), <<>>}
+
+  defp extract_w_complete_obus(data, count, acc) do
+    case LEB128.read(data) do
+      {:ok, leb_size, obu_length} ->
+        <<_leb::binary-size(leb_size), rest::binary>> = data
+
+        if obu_length <= byte_size(rest) do
+          <<obu::binary-size(obu_length), remaining::binary>> = rest
+          extract_w_complete_obus(remaining, count - 1, [obu | acc])
+        else
+          # Truncated - return what we have
+          {Enum.reverse(acc), data}
+        end
+
+      {:error, _} ->
+        {Enum.reverse(acc), data}
     end
   end
 
@@ -376,9 +502,11 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     Membrane.Logger.debug("N=1: New coded video sequence starting at timestamp #{timestamp}")
 
     # Extract sequence header based on format
+    # For {:obus_and_fragment, ...}, check the complete OBUs for sequence header
     seq_header =
       case extracted_obus do
         {:obus, obu_list} -> find_sequence_header_in_list(obu_list)
+        {:obus_and_fragment, obu_list, _fragment} -> find_sequence_header_in_list(obu_list)
         {:fragment, _binary} -> nil
       end
 
@@ -489,7 +617,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # OBU Fragment Handling (Z/Y Bits)
   # -----------------------------------------------------------------------------
 
-  # extracted_obus: Either {:obus, [list]} or {:fragment, binary}
+  # extracted_obus: {:obus, [list]}, {:fragment, binary}, or {:obus_and_fragment, [list], binary}
   defp handle_obu_fragments(state, av1_payload, extracted_obus, timestamp, pts) do
     case {av1_payload.z, av1_payload.y, state.current_obu_fragment} do
       # Z=0, Y=0: Single complete OBU (or multiple complete OBUs)
@@ -508,11 +636,9 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         |> reset_obu_fragment()
         |> append_obus(timestamp, extracted_obus, pts)
 
-      # Z=0, Y=1: First fragment of an OBU
-      # For fragments, extracted_obus is {:fragment, binary}
+      # Z=0, Y=1: First fragment of an OBU (possibly with complete OBUs before it)
       {0, 1, nil} ->
-        {:fragment, fragment_data} = extracted_obus
-        start_obu_fragment(state, timestamp, fragment_data, pts)
+        handle_y1_packet(state, extracted_obus, timestamp, pts)
 
       # Z=0, Y=1: First fragment but we already have one (packet loss case)
       {0, 1, _fragment} ->
@@ -521,11 +647,10 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         )
 
         emit_fragment_dropped_telemetry(:new_fragment_started, 0, 1)
-        {:fragment, fragment_data} = extracted_obus
 
         state
         |> reset_obu_fragment()
-        |> start_obu_fragment(timestamp, fragment_data, pts)
+        |> handle_y1_packet(extracted_obus, timestamp, pts)
 
       # Z=1, Y=0: Last fragment of an OBU
       {1, 0, fragment} when fragment != nil and timestamp == state.current_timestamp ->
@@ -561,6 +686,25 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         emit_fragment_dropped_telemetry(:no_matching_first, 1, 1)
         reset_obu_fragment(state)
     end
+  end
+
+  # Handle Y=1 packets which may have complete OBUs followed by a trailing fragment
+  defp handle_y1_packet(state, {:fragment, fragment_data}, timestamp, pts) do
+    # Pure fragment - no complete OBUs
+    start_obu_fragment(state, timestamp, fragment_data, pts)
+  end
+
+  defp handle_y1_packet(state, {:obus_and_fragment, obu_list, fragment_data}, timestamp, pts) do
+    # Complete OBUs followed by a fragment
+    # First, append the complete OBUs to the temporal unit
+    state = append_obus(state, timestamp, {:obus, obu_list}, pts)
+    # Then, start the fragment
+    start_obu_fragment(state, timestamp, fragment_data, pts)
+  end
+
+  defp handle_y1_packet(state, {:obus, obu_list}, timestamp, pts) do
+    # Edge case: Y=1 but all OBUs turned out to be complete (shouldn't happen but handle gracefully)
+    append_obus(state, timestamp, {:obus, obu_list}, pts)
   end
 
   defp emit_fragment_dropped_telemetry(reason, z, y) do
@@ -599,6 +743,12 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # -----------------------------------------------------------------------------
   # OBU Accumulation
   # -----------------------------------------------------------------------------
+
+  # Handle {:obus_and_fragment, ...} by extracting just the complete OBUs
+  # This is a defensive clause - normally handle_y1_packet processes this format
+  defp append_obus(state, timestamp, {:obus_and_fragment, obu_list, _fragment}, pts) do
+    append_obus(state, timestamp, {:obus, obu_list}, pts)
+  end
 
   # Handle {:obus, list} format - filter and concatenate
   defp append_obus(state, timestamp, {:obus, obu_list}, pts) do
