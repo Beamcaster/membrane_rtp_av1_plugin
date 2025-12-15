@@ -31,7 +31,7 @@ defmodule Membrane.RTP.AV1.MixProject do
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:benchee, "~> 1.3", only: :dev, runtime: false},
       {:stream_data, "~> 1.0", only: :test},
-      {:rav1d_ex, git: "git@gitlab.com:maslo.rails/rav1d_ex.git"}
+      {:rav1d_ex, git: "git@gitlab.com:maslo.rails/rav1d_ex.git", branch: "fix-segfault"}
     ]
   end
 
