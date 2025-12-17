@@ -31,12 +31,13 @@ defmodule Membrane.RTP.AV1.MixProject do
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:benchee, "~> 1.3", only: :dev, runtime: false},
       {:stream_data, "~> 1.0", only: :test},
-      {:rav1d_ex, ">= 0.0.0"}
+      {:rav1d_ex, ">= 0.0.0", organization: "beamcaster"}
     ]
   end
 
   defp package do
     [
+      organization: "beamcaster",
       licenses: ["MIT"],
       links: %{
         "GitHub" => "https://github.com/membraneframework/membrane_rtp_av1_plugin",
