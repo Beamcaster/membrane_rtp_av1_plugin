@@ -26,12 +26,12 @@ defmodule Membrane.RTP.AV1.MixProject do
       {:membrane_core, "~> 1.0"},
       {:membrane_rtp_plugin, "~> 0.24"},
       {:membrane_raw_video_format, "~> 0.4.1"},
-      {:bunch, "~> 1.5", override: true},
+      {:bunch, "~> 1.5"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:benchee, "~> 1.3", only: :dev, runtime: false},
       {:stream_data, "~> 1.0", only: :test},
-      {:rav1d_ex, git: "git@gitlab.com:maslo.rails/rav1d_ex.git"}
+      {:rav1d_ex, ">= 0.0.0"}
     ]
   end
 
