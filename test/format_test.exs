@@ -1,7 +1,7 @@
 defmodule Membrane.RTP.AV1.FormatTest do
   use ExUnit.Case, async: true
 
-  alias Membrane.RTP.AV1.{Format, FMTP, SDP}
+  alias Membrane.RTP.AV1.{Format, FMTP}
 
   doctest Membrane.RTP.AV1.Format
 

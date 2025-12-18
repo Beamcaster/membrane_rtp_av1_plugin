@@ -813,7 +813,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # Opportunistically cache sequence header even if N bit wasn't set
   # This handles edge cases where sequence header arrives mid-stream
   # Accepts list of OBUs
-  defp maybe_cache_sequence_header_opportunistic(state, obu_list, timestamp) when is_list(obu_list) do
+  defp maybe_cache_sequence_header_opportunistic(state, obu_list, timestamp)
+       when is_list(obu_list) do
     if state.require_sequence_header do
       case find_sequence_header_in_list(obu_list) do
         nil ->
@@ -1171,91 +1172,6 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
       _ ->
         :not_found
-    end
-  end
-
-  # Iterate through OBUs in data, calling function for each
-  defp iterate_obus(data, acc, fun), do: iterate_obus_impl(data, acc, fun)
-
-  defp iterate_obus_impl(<<>>, acc, _fun), do: acc
-
-  defp iterate_obus_impl(data, acc, fun) do
-    case get_obu_total_size(data) do
-      {:ok, total_size} when total_size > 0 and total_size <= byte_size(data) ->
-        case parse_obu_header(data) do
-          {:ok, obu_info} ->
-            acc = fun.(obu_info.type, acc)
-            <<_::binary-size(total_size), rest::binary>> = data
-            iterate_obus_impl(rest, acc, fun)
-
-          {:error, _} ->
-            acc
-        end
-
-      _ ->
-        acc
-    end
-  end
-
-  # Strip temporal delimiters and tile list OBUs (per RTP spec recommendations)
-  defp strip_unwanted_obus(data), do: strip_unwanted_obus_impl(data, <<>>)
-
-  defp strip_unwanted_obus_impl(<<>>, acc), do: acc
-
-  defp strip_unwanted_obus_impl(data, acc) do
-    case get_obu_total_size(data) do
-      {:ok, total_size} when total_size > 0 and total_size <= byte_size(data) ->
-        <<obu_data::binary-size(total_size), rest::binary>> = data
-
-        case parse_obu_header(obu_data) do
-          {:ok, obu_info} ->
-            # Keep everything except temporal delimiters and tile lists
-            new_acc =
-              if obu_info.type in [@obu_temporal_delimiter, @obu_tile_list] do
-                acc
-              else
-                acc <> obu_data
-              end
-
-            strip_unwanted_obus_impl(rest, new_acc)
-
-          {:error, _} ->
-            # Can't parse header - keep data as-is
-            acc <> data
-        end
-
-      _ ->
-        # Can't determine size - keep remaining data as-is
-        acc <> data
-    end
-  end
-
-  # Extract sequence header OBU from data
-  defp extract_sequence_header(data), do: find_obu_by_type(data, @obu_sequence_header)
-
-  # Find and extract a specific OBU type
-  defp find_obu_by_type(data, target_type), do: find_obu_by_type_impl(data, target_type)
-
-  defp find_obu_by_type_impl(<<>>, _target_type), do: nil
-
-  defp find_obu_by_type_impl(data, target_type) do
-    case get_obu_total_size(data) do
-      {:ok, total_size} when total_size > 0 and total_size <= byte_size(data) ->
-        <<obu_data::binary-size(total_size), rest::binary>> = data
-
-        case parse_obu_header(obu_data) do
-          {:ok, %{type: ^target_type}} ->
-            obu_data
-
-          {:ok, _} ->
-            find_obu_by_type_impl(rest, target_type)
-
-          {:error, _} ->
-            nil
-        end
-
-      _ ->
-        nil
     end
   end
 

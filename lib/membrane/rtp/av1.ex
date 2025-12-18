@@ -1,31 +1,24 @@
 defmodule Membrane.RTP.AV1 do
   @moduledoc """
-  RTP payload format registration for AV1.
+  AV1 RTP payload format constants and utilities.
 
-  This module registers AV1 with the Membrane RTP framework, making it
-  discoverable by RTP muxers, demuxers, and other generic RTP components.
-
-  The registration includes:
+  This module provides constants for AV1 RTP streams:
   - Encoding name: `:AV1`
   - Clock rate: `90000` Hz (fixed per AV1 RTP spec)
-  - Payloader: `Membrane.RTP.AV1.Payloader`
-  - Depayloader: `Membrane.RTP.AV1.Depayloader`
 
-  ## Usage
+  ## Main Components
 
-  The registration happens automatically when the application starts.
-  No manual registration is needed.
+  - `Membrane.RTP.AV1.ExWebRTCDepayloader` - Depayloads AV1 from RTP packets
+  - `Membrane.RTP.AV1.Rav1dDecoder` - Decodes AV1 temporal units to raw video
+  - `Membrane.RTP.AV1.Format` - Stream format for AV1
 
-  ## Example
+  ## Example Pipeline
 
-      # In a pipeline, the RTP muxer can automatically discover AV1 format:
-      child(:source, %MySource{})
-      |> child(:payloader, %Membrane.RTP.AV1.Payloader{})
-      |> child(:rtp_muxer, Membrane.RTP.Muxer)
-
+      child(:rtp_parser, Membrane.RTP.Parser)
+      |> child(:depayloader, Membrane.RTP.AV1.ExWebRTCDepayloader)
+      |> child(:decoder, Membrane.RTP.AV1.Rav1dDecoder)
+      |> child(:sink, YourVideoSink)
   """
-
-  alias Membrane.RTP.PayloadFormat
 
   @encoding_name :AV1
   @clock_rate 90_000
@@ -41,17 +34,4 @@ defmodule Membrane.RTP.AV1 do
   """
   @spec clock_rate() :: pos_integer()
   def clock_rate, do: @clock_rate
-
-  @doc false
-  def __register__() do
-    PayloadFormat.register(%PayloadFormat{
-      encoding_name: @encoding_name,
-      payloader: Membrane.RTP.AV1.Payloader,
-      depayloader: Membrane.RTP.AV1.Depayloader,
-      # AV1 doesn't have a static payload type - uses dynamic range (96-127)
-      payload_type: nil
-    })
-
-    :ok
-  end
 end

@@ -16,8 +16,7 @@ defmodule Membrane.RTP.AV1.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
-      mod: {Membrane.RTP.AV1.Plugin.Application, []}
+      extra_applications: [:logger]
     ]
   end
 
