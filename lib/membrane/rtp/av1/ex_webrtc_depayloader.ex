@@ -123,7 +123,10 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
             waiting_for_keyframe: boolean(),
             waiting_for_sequence_header: boolean(),
             last_n_bit_timestamp: non_neg_integer() | nil,
-            frames_since_sequence_header: non_neg_integer()
+            frames_since_sequence_header: non_neg_integer(),
+            # True after a keyframe (N=1) has been successfully output to decoder
+            # Inter frames are dropped until this is true to prevent decoder crashes
+            keyframe_established: boolean()
           }
 
     defstruct [
@@ -151,7 +154,11 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       # Timestamp when we last saw N=1
       last_n_bit_timestamp: nil,
       # Count of frames output since last sequence header (for diagnostics)
-      frames_since_sequence_header: 0
+      frames_since_sequence_header: 0,
+      # True after a keyframe (N=1) has been successfully output to decoder
+      # Inter frames are dropped until this is true to prevent decoder crashes
+      # from missing reference frames
+      keyframe_established: false
     ]
   end
 
@@ -632,7 +639,9 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
         emit_fragment_dropped_telemetry(:incomplete_fragment_replaced, 0, 0)
 
+        # Packet loss detected - reset keyframe state as decoder references may be stale
         state
+        |> handle_packet_loss()
         |> reset_obu_fragment()
         |> append_obus(timestamp, extracted_obus, pts)
 
@@ -648,7 +657,9 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
         emit_fragment_dropped_telemetry(:new_fragment_started, 0, 1)
 
+        # Packet loss detected - reset keyframe state
         state
+        |> handle_packet_loss()
         |> reset_obu_fragment()
         |> handle_y1_packet(extracted_obus, timestamp, pts)
 
@@ -666,11 +677,15 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       # Z=1, Y=0: Last fragment but no matching first fragment
       {1, 0, _} ->
         Membrane.Logger.warning(
-          "Received last OBU fragment without matching first fragment - dropping"
+          "Received last OBU fragment without matching first fragment - dropping (packet loss)"
         )
 
         emit_fragment_dropped_telemetry(:no_matching_first, 1, 0)
-        reset_obu_fragment(state)
+
+        # Packet loss detected - reset keyframe state
+        state
+        |> handle_packet_loss()
+        |> reset_obu_fragment()
 
       # Z=1, Y=1: Middle fragment of an OBU
       {1, 1, fragment} when fragment != nil and timestamp == state.current_timestamp ->
@@ -680,11 +695,30 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       # Z=1, Y=1: Middle fragment but no matching first fragment
       {1, 1, _} ->
         Membrane.Logger.debug(
-          "Received middle OBU fragment without matching first fragment - dropping"
+          "Received middle OBU fragment without matching first fragment - dropping (packet loss)"
         )
 
         emit_fragment_dropped_telemetry(:no_matching_first, 1, 1)
-        reset_obu_fragment(state)
+
+        # Packet loss detected - reset keyframe state
+        state
+        |> handle_packet_loss()
+        |> reset_obu_fragment()
+    end
+  end
+
+  # Handle packet loss by resetting keyframe state
+  # This ensures decoder won't receive inter frames with stale references
+  defp handle_packet_loss(state) do
+    if state.keyframe_established do
+      Membrane.Logger.warning("""
+      Packet loss detected - resetting keyframe state
+      Decoder will wait for next keyframe before accepting inter frames
+      """)
+
+      %{state | keyframe_established: false, waiting_for_keyframe: true}
+    else
+      state
     end
   end
 
@@ -948,6 +982,9 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     has_frame_data =
       analysis.has_frame or (analysis.has_frame_header and analysis.has_tile_group)
 
+    # Check if this is a keyframe (contains sequence header - indicates N=1 coded video sequence start)
+    is_keyframe = analysis.sequence_header != nil
+
     cond do
       # No cached sequence header and we have frame data - can't decode, request keyframe
       state.cached_sequence_header == nil and has_frame_data ->
@@ -964,8 +1001,35 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
         {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
          %{state | waiting_for_keyframe: true}}
 
-      # Have cached sequence header but temporal unit doesn't include one - prepend it
+      # CRITICAL: Inter frame arrived before any keyframe was established
+      # Decoder has no reference frames yet - outputting would crash decoder
+      # This catches the case where we have cached seq header from a previous
+      # session but decoder was reset/restarted
+      not state.keyframe_established and not is_keyframe and has_frame_data ->
+        Membrane.Logger.warning("""
+        Dropping inter frame - no keyframe has been established yet
+        Decoder needs a keyframe first to initialize reference frames
+        Requesting keyframe (PLI)
+        """)
+
+        emit_keyframe_requested_telemetry(:no_keyframe_established)
+
+        {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
+         %{state | waiting_for_keyframe: true}}
+
+      # Keyframe (has sequence header) - output and mark keyframe as established
+      is_keyframe and has_frame_data ->
+        output = prepend_temporal_delimiter(temporal_unit)
+        buffer = build_buffer(output, pts)
+
+        Membrane.Logger.debug("Keyframe output - decoder reference frames will be established")
+
+        {[buffer: {:output, buffer}],
+         %{state | keyframe_established: true, waiting_for_keyframe: false}}
+
+      # Have cached sequence header, keyframe established, but this frame doesn't include seq header - prepend it
       state.cached_sequence_header != nil and
+        state.keyframe_established and
         analysis.sequence_header == nil and
           has_frame_data ->
         output =

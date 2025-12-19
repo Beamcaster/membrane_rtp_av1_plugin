@@ -128,7 +128,7 @@ defmodule Membrane.RTP.AV1.Rav1dDecoder do
 
         # Create output buffer with sequential PTS
         # Each frame in the batch gets an incremented timestamp
-        frame_pts = pts + frame_idx * frame_duration
+        frame_pts = (pts || 0) + frame_idx * frame_duration
         frame_buffer = create_frame_buffer(frame, frame_pts, format_state)
 
         # Combine actions
