@@ -955,7 +955,8 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     if not state.require_sequence_header do
       # Sequence header management disabled - output as-is with temporal delimiter
       output = prepend_temporal_delimiter(temporal_unit)
-      buffer = build_buffer(output, pts)
+      is_keyframe = contains_sequence_header?(temporal_unit)
+      buffer = build_buffer(output, pts, is_keyframe)
       {[buffer: {:output, buffer}], state}
     else
       build_output_with_managed_sequence_header(temporal_unit, pts, state)
@@ -1020,7 +1021,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       # Keyframe (has sequence header) - output and mark keyframe as established
       is_keyframe and has_frame_data ->
         output = prepend_temporal_delimiter(temporal_unit)
-        buffer = build_buffer(output, pts)
+        buffer = build_buffer(output, pts, true)
 
         Membrane.Logger.debug("Keyframe output - decoder reference frames will be established")
 
@@ -1038,13 +1039,13 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
             temporal_unit
           )
 
-        buffer = build_buffer(output, pts)
+        buffer = build_buffer(output, pts, false)
         {[buffer: {:output, buffer}], state}
 
       # Temporal unit already has sequence header or no frame data
       true ->
         output = prepend_temporal_delimiter(temporal_unit)
-        buffer = build_buffer(output, pts)
+        buffer = build_buffer(output, pts, is_keyframe)
         {[buffer: {:output, buffer}], state}
     end
   end
@@ -1057,13 +1058,14 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
     )
   end
 
-  defp build_buffer(payload, pts) do
+  defp build_buffer(payload, pts, key_frame?) do
     %Buffer{
       payload: payload,
       pts: pts,
       metadata: %{
         av1: %{
-          temporal_unit_size: byte_size(payload)
+          temporal_unit_size: byte_size(payload),
+          key_frame?: key_frame?
         }
       }
     }
@@ -1237,6 +1239,11 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       _ ->
         :not_found
     end
+  end
+
+  # Quick check if temporal unit contains a sequence header (indicates keyframe)
+  defp contains_sequence_header?(data) do
+    analyze_temporal_unit(data).sequence_header != nil
   end
 
   # Analyze temporal unit for presence of key OBU types
