@@ -309,34 +309,53 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   # - Y=1: Last OBU element will continue in next packet
   # When Y=1, there may be complete OBUs BEFORE the trailing fragment!
   defp extract_obus_from_rtp_payload(%{w: w, z: z, y: y, payload: payload}) do
-    cond do
-      # Z=1: This packet starts with a continuation fragment
-      # The entire payload (or first OBU element) is fragment data
-      z == 1 ->
-        {:fragment, payload}
+    result =
+      cond do
+        # Z=1: This packet starts with a continuation fragment
+        # The entire payload (or first OBU element) is fragment data
+        z == 1 ->
+          {:fragment, payload}
 
-      # Y=1, Z=0: Last OBU continues in next packet, but preceding OBUs are complete
-      # We need to extract complete OBUs and identify the trailing fragment
-      y == 1 and z == 0 ->
-        extract_obus_with_trailing_fragment(payload, w)
+        # Y=1, Z=0: Last OBU continues in next packet, but preceding OBUs are complete
+        # We need to extract complete OBUs and identify the trailing fragment
+        y == 1 and z == 0 ->
+          extract_obus_with_trailing_fragment(payload, w)
 
-      # Z=0, Y=0: All OBUs are complete
-      # W=0: Length-prefixed format - all OBUs have LEB128 prefix
-      w == 0 ->
-        {:obus, extract_length_prefixed_obus(payload, [])}
+        # Z=0, Y=0: All OBUs are complete
+        # W=0: Length-prefixed format - all OBUs have LEB128 prefix
+        w == 0 ->
+          {:obus, extract_length_prefixed_obus(payload, [])}
 
-      # W=1: Single OBU, no length prefix (extends to end of packet)
-      w == 1 ->
-        {:obus, [payload]}
+        # W=1: Single OBU, no length prefix (extends to end of packet)
+        w == 1 ->
+          {:obus, [payload]}
 
-      # W=2-3: Multiple OBUs, all but last have LEB128 prefix
-      w in 2..3 ->
-        {:obus, extract_w_obus(payload, w, [])}
+        # W=2-3: Multiple OBUs, all but last have LEB128 prefix
+        w in 2..3 ->
+          {:obus, extract_w_obus(payload, w, [])}
 
-      true ->
-        # Fallback: treat as single OBU
-        {:obus, [payload]}
-    end
+        true ->
+          # Fallback: treat as single OBU
+          {:obus, [payload]}
+      end
+
+    # Normalize OBUs to have size fields for proper parsing later
+    # This prevents false OBU header detection in analyze_temporal_unit
+    normalize_extracted_obus(result)
+  end
+
+  # Normalize extracted OBUs to ensure they have size fields
+  defp normalize_extracted_obus({:obus, obus}) do
+    {:obus, ensure_obus_have_size_fields(obus)}
+  end
+
+  defp normalize_extracted_obus({:fragment, fragment}) do
+    # Fragments are partial OBUs - we'll normalize when complete
+    {:fragment, fragment}
+  end
+
+  defp normalize_extracted_obus({:obus_and_fragment, obus, fragment}) do
+    {:obus_and_fragment, ensure_obus_have_size_fields(obus), fragment}
   end
 
   # Extract complete OBUs when Y=1 (last OBU is a fragment)
@@ -667,12 +686,14 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
       {1, 0, fragment} when fragment != nil and timestamp == state.current_timestamp ->
         {:fragment, fragment_data} = extracted_obus
         complete_obu = fragment <> fragment_data
+        # Normalize the reassembled OBU to ensure it has a size field
+        normalized_obu = ensure_obu_has_size_field(complete_obu)
 
         state
         |> reset_obu_fragment()
         # Use existing current_pts since this is a continuation (not first packet)
         # Wrap in list for append_obus
-        |> append_obus(timestamp, {:obus, [complete_obu]}, state.current_pts)
+        |> append_obus(timestamp, {:obus, [normalized_obu]}, state.current_pts)
 
       # Z=1, Y=0: Last fragment but no matching first fragment
       {1, 0, _} ->
@@ -1162,6 +1183,57 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
 
   def parse_obu_header(<<>>), do: {:error, :empty_data}
   def parse_obu_header(_), do: {:error, :invalid_data}
+
+  # -----------------------------------------------------------------------------
+  # OBU Size Field Normalization
+  # -----------------------------------------------------------------------------
+
+  # Ensures an OBU has the obu_has_size_field set and includes a proper LEB128 size.
+  # This is critical for correct parsing when OBUs are concatenated into temporal units.
+  #
+  # GStreamer sends OBUs without size fields (obu_has_size_field=0), which is valid
+  # per RFC 9628. However, when these OBUs are concatenated, we lose boundary info
+  # and the heuristic boundary scanning in analyze_temporal_unit can find false OBU
+  # headers in frame data.
+  #
+  # By adding size fields during extraction, we ensure proper parsing later.
+  defp ensure_obu_has_size_field(obu) when byte_size(obu) < 1, do: obu
+
+  defp ensure_obu_has_size_field(<<header::8, rest::binary>> = obu) do
+    has_extension = (header &&& 0x04) != 0
+    has_size = (header &&& 0x02) != 0
+
+    if has_size do
+      # Already has size field, return as-is
+      obu
+    else
+      # Need to add size field
+      # Calculate payload size (everything after header and optional extension)
+      {payload, ext_byte} =
+        if has_extension and byte_size(rest) >= 1 do
+          <<ext::binary-size(1), payload::binary>> = rest
+          {payload, ext}
+        else
+          {rest, <<>>}
+        end
+
+      payload_size = byte_size(payload)
+      size_leb = LEB128.encode(payload_size)
+
+      # Set the has_size bit (bit 1) in the header
+      new_header = header ||| 0x02
+
+      # Reconstruct OBU: header + extension (if any) + size + payload
+      <<new_header, ext_byte::binary, size_leb::binary, payload::binary>>
+    end
+  end
+
+  defp ensure_obu_has_size_field(obu), do: obu
+
+  # Apply size field normalization to a list of OBUs
+  defp ensure_obus_have_size_fields(obus) when is_list(obus) do
+    Enum.map(obus, &ensure_obu_has_size_field/1)
+  end
 
   # Read OBU size using LEB128 encoding
   defp read_obu_size(data) do
