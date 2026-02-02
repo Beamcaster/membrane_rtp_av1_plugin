@@ -97,8 +97,6 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
 
   def decode(_), do: {:error, :invalid_ss_format}
 
-  # Validation
-
   defp validate_structure(%__MODULE__{n_s: n_s, n_g: n_g, spatial_layers: layers, pictures: pics}) do
     cond do
       n_s > 7 ->
@@ -132,13 +130,10 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
 
   defp valid_picture?(%{temporal_id: t, spatial_id: s, reference_count: r, p_diffs: diffs}, n_s)
        when t in 0..7 and s in 0..3 and r in 0..3 and is_list(diffs) do
-    # p_diffs length should equal number of spatial layers
     length(diffs) == n_s + 1 and Enum.all?(diffs, &(&1 >= 0 and &1 <= 255))
   end
 
   defp valid_picture?(_, _), do: false
-
-  # Encoding helpers
 
   defp encode_header(%__MODULE__{n_s: n_s, y_flag: y, n_g: n_g}) do
     y_bit = if y, do: 1, else: 0
@@ -165,10 +160,8 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
   defp encode_pictures(%__MODULE__{pictures: pictures, n_s: n_s}) do
     encoded =
       Enum.map(pictures, fn %{temporal_id: t, spatial_id: s, reference_count: r, p_diffs: diffs} ->
-        # T (3 bits) | U (spatial_id, 2 bits) | R (reference_count, 2 bits) | reserved (1 bit)
         byte0 = t <<< 5 ||| s <<< 3 ||| r <<< 1
 
-        # P_DIFF values for each spatial layer
         p_diff_bytes =
           diffs
           |> Enum.take(n_s + 1)
@@ -180,18 +173,14 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
     {:ok, IO.iodata_to_binary(encoded)}
   end
 
-  # Decoding helpers
-
   defp decode_spatial_layers(rest, 0, _y, acc), do: {:ok, acc, rest}
 
   defp decode_spatial_layers(<<w::16, h::16, rest::binary>>, count, true = y, acc) do
-    # Y=1 means no frame rate included
     layer = %{width: w, height: h, frame_rate: nil}
     decode_spatial_layers(rest, count - 1, y, [layer | acc])
   end
 
   defp decode_spatial_layers(<<w::16, h::16, fr::16, rest::binary>>, count, false = y, acc) do
-    # Y=0 means frame rate is included
     layer = %{width: w, height: h, frame_rate: fr}
     decode_spatial_layers(rest, count - 1, y, [layer | acc])
   end
@@ -205,7 +194,6 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
     s = (byte0 &&& 0b0001_1000) >>> 3
     r = (byte0 &&& 0b0000_0110) >>> 1
 
-    # Read P_DIFF values for each spatial layer (n_s + 1 total)
     num_p_diffs = n_s + 1
 
     if byte_size(rest) < num_p_diffs do
@@ -233,10 +221,8 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
     frame_rate = Keyword.get(opts, :frame_rate, 30)
     temporal_layers = Keyword.get(opts, :temporal_layers, 1)
 
-    # Single spatial layer
     spatial_layers = [%{width: width, height: height, frame_rate: frame_rate}]
 
-    # Create picture descriptions for each temporal layer
     pictures =
       for t <- 0..(temporal_layers - 1) do
         %{
@@ -272,7 +258,6 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
         %{width: w, height: h, frame_rate: nil}
       end)
 
-    # Create picture descriptions for all combinations of temporal and spatial layers
     pictures =
       for t <- 0..(temporal_layers - 1),
           s <- 0..n_s do
@@ -280,7 +265,6 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
           temporal_id: t,
           spatial_id: s,
           reference_count: if(t == 0, do: 0, else: 1),
-          # Simple dependency: reference previous frame in same spatial layer
           p_diffs: List.duplicate(if(t == 0, do: 0, else: 1), n_s + 1)
         }
       end

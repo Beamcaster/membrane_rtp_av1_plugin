@@ -28,15 +28,12 @@ defmodule Membrane.RTP.AV1.FMTP do
   @type tier :: 0..1
 
   @type t :: %__MODULE__{
-          # Standard codec parameters
           profile: profile() | nil,
           level_idx: level_idx() | nil,
           tier: tier() | nil,
-          # Layer parameters
           cm: 0 | 1 | nil,
           temporal_id: 0..7 | nil,
           spatial_id: 0..3 | nil,
-          # Scalability structure
           scalability_structure: ScalabilityStructure.t() | nil
         }
 
@@ -108,10 +105,10 @@ defmodule Membrane.RTP.AV1.FMTP do
   Parse a map of fmtp parameters into a typed struct with validation.
 
   Supports both string and atom keys. Parameter names are normalized:
-  - "profile-id" or "profile" → :profile
-  - "level-idx" → :level_idx
-  - "tid" or "temporal_id" → :temporal_id
-  - "lid" or "spatial_id" → :spatial_id
+  - "profile-id" or "profile" -> :profile
+  - "level-idx" -> :level_idx
+  - "tid" or "temporal_id" -> :temporal_id
+  - "lid" or "spatial_id" -> :spatial_id
 
   ## Parameters
 
@@ -178,9 +175,6 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Private parsing functions
-
-  # Parse a single "key=value" parameter
   defp parse_param(param_string) do
     case String.split(param_string, "=", parts: 2) do
       [key, value] ->
@@ -193,7 +187,6 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Normalize parameter names to atoms
   defp normalize_key("profile-id"), do: :profile
   defp normalize_key("profile"), do: :profile
   defp normalize_key("level-idx"), do: :level_idx
@@ -207,14 +200,12 @@ defmodule Membrane.RTP.AV1.FMTP do
   defp normalize_key("ss_data"), do: :ss_data
   defp normalize_key(key), do: String.to_atom(key)
 
-  # Get integer value from params map (handles both string and atom keys, string and int values)
   defp get_int(params, keys) when is_list(keys) do
     Enum.find_value(keys, fn key ->
       case Map.get(params, key) || Map.get(params, to_string(key)) do
         nil ->
           nil
 
-        # Treat empty string as nil
         "" ->
           nil
 
@@ -233,7 +224,6 @@ defmodule Membrane.RTP.AV1.FMTP do
     end)
   end
 
-  # Parse profile parameter
   defp parse_profile(params) do
     case get_int(params, [:profile, "profile", "profile-id", "profile_id"]) do
       nil -> {:ok, nil}
@@ -242,7 +232,6 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Parse level-idx parameter
   defp parse_level_idx(params) do
     case get_int(params, [:level_idx, "level-idx", "level_idx"]) do
       nil -> {:ok, nil}
@@ -251,7 +240,6 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Parse tier parameter
   defp parse_tier(params) do
     case get_int(params, [:tier, "tier"]) do
       nil -> {:ok, nil}
@@ -260,7 +248,6 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Parse cm (congestion management) parameter
   defp parse_cm(params) do
     case get_int(params, [:cm, "cm"]) do
       nil -> {:ok, nil}
@@ -269,7 +256,6 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Parse temporal_id parameter
   defp parse_temporal_id(params) do
     case get_int(params, [:tid, "tid", :temporal_id, "temporal_id"]) do
       nil -> {:ok, nil}
@@ -278,7 +264,6 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Parse spatial_id parameter
   defp parse_spatial_id(params) do
     case get_int(params, [:lid, "lid", :spatial_id, "spatial_id"]) do
       nil -> {:ok, nil}
@@ -287,15 +272,12 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Parse scalability structure
   defp parse_scalability_structure(params) do
-    # Check if SS is provided directly as a struct
     case Map.get(params, :ss) || Map.get(params, "ss") do
       %ScalabilityStructure{} = ss ->
         {:ok, ss}
 
       nil ->
-        # Try to decode from hex-encoded ss_data
         parse_ss_data(params)
 
       _ ->
@@ -325,15 +307,11 @@ defmodule Membrane.RTP.AV1.FMTP do
     end
   end
 
-  # Validate parameter combinations according to AV1 RTP spec
   defp validate_param_combinations(profile, _level_idx, tier, _cm, _tid, _lid) do
-    # Profile 0 (Main) supports tier 0 only (when both are specified)
     cond do
       profile == 0 and tier == 1 ->
         {:error, "Profile 0 (Main) only supports tier 0"}
 
-      # All other combinations are valid
-      # Note: tier without level-idx is allowed in SDP (indicates preference without strict constraint)
       true ->
         :ok
     end

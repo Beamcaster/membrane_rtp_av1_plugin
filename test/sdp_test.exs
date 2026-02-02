@@ -86,7 +86,6 @@ defmodule Membrane.RTP.AV1.SDPTest do
     end
 
     test "maintains parameter order: profile, level, tier" do
-      # Test that parameters appear in the correct order
       fmtp = SDP.fmtp(96, tier: 1, level: "4.0", profile: 0)
       assert fmtp == "a=fmtp:96 profile=0;level-idx=8;tier=1"
     end
@@ -122,7 +121,6 @@ defmodule Membrane.RTP.AV1.SDPTest do
     end
 
     test "generates rtpmap only when options don't produce fmtp" do
-      # Invalid level should not generate fmtp
       assert SDP.generate(96, level: "invalid") == ["a=rtpmap:96 AV1/90000"]
     end
   end
@@ -141,7 +139,6 @@ defmodule Membrane.RTP.AV1.SDPTest do
 
   describe "level mapping completeness" do
     test "supports all AV1 levels from 2.0 to 7.3" do
-      # Test a representative sample of levels
       levels_to_test = [
         {"2.0", 0},
         {"2.3", 3},
@@ -168,7 +165,6 @@ defmodule Membrane.RTP.AV1.SDPTest do
 
   describe "real-world SDP examples" do
     test "generates SDP for typical WebRTC scenario" do
-      # Main profile, Level 4.0, Main tier
       result = SDP.generate(96, profile: 0, level: "4.0", tier: 0)
 
       assert result == [
@@ -178,7 +174,6 @@ defmodule Membrane.RTP.AV1.SDPTest do
     end
 
     test "generates SDP for high-quality streaming" do
-      # High profile, Level 5.1, Main tier
       result = SDP.generate(97, profile: 1, level: "5.1", tier: 0)
 
       assert result == [
@@ -188,13 +183,11 @@ defmodule Membrane.RTP.AV1.SDPTest do
     end
 
     test "generates minimal SDP for basic use case" do
-      # No profile/level restrictions
       result = SDP.generate(96)
       assert result == ["a=rtpmap:96 AV1/90000"]
     end
 
     test "generates SDP with profile constraint only" do
-      # Constrain to Main profile, any level
       result = SDP.generate(96, profile: 0)
 
       assert result == [
@@ -207,13 +200,11 @@ defmodule Membrane.RTP.AV1.SDPTest do
   describe "integration with SDP parsing" do
     test "rtpmap format is parseable" do
       rtpmap = SDP.rtpmap(96)
-      # Format: a=rtpmap:<payload> <encoding>/<clock_rate>
       assert rtpmap =~ ~r/^a=rtpmap:\d+ \w+\/\d+$/
     end
 
     test "fmtp format is parseable" do
       fmtp = SDP.fmtp(96, profile: 0, level: "4.0", tier: 0)
-      # Format: a=fmtp:<payload> <param>=<value>;...
       assert fmtp =~ ~r/^a=fmtp:\d+ [\w\-]+=[\w\-]+(;[\w\-]+=[\w\-]+)*$/
     end
 

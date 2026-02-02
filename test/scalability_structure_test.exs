@@ -47,7 +47,6 @@ defmodule Membrane.RTP.AV1.ScalabilityStructureTest do
                %{width: 1920, height: 1080, frame_rate: nil}
              ]
 
-      # Should have temporal_layers * spatial_layers pictures (up to 15)
       assert ss.n_g == 6
       assert length(ss.pictures) == 6
     end
@@ -56,7 +55,6 @@ defmodule Membrane.RTP.AV1.ScalabilityStructureTest do
       spatial_resolutions = [{1920, 1080}, {3840, 2160}]
       ss = ScalabilityStructure.svc(spatial_resolutions, 10)
 
-      # 2 spatial layers * 10 temporal layers = 20, but capped at 15
       assert ss.n_g == 15
       assert length(ss.pictures) == 15
     end
@@ -127,20 +125,9 @@ defmodule Membrane.RTP.AV1.ScalabilityStructureTest do
 
   describe "validation" do
     test "rejects structure exceeding max size" do
-      # Create a structure that would exceed 255 bytes
-      # With n_s=7 (8 layers), each layer = 6 bytes (w+h, no frame_rate when Y=1)
-      # Header = 1 byte, Layers = 48 bytes
-      # Each picture = 1 + 8 p_diffs = 9 bytes
-      # For 255 bytes total: 1 + 48 + (9 * pictures) <= 255
-      # pictures <= (255 - 49) / 9 = 22.88, so 15 pictures = 184 total bytes (fits!)
-      # We need more - let's use Y=0 to include frame rates: 8 bytes per layer = 64 bytes
-      # 1 + 64 + (9 * 15) = 200 bytes (still fits!)
-
-      # Actually, let's just create an invalid structure that violates n_s > 7
       spatial_layers = for _ <- 1..20, do: {1920, 1080}
 
       ss = %ScalabilityStructure{
-        # Invalid: > 7
         n_s: 19,
         y_flag: true,
         n_g: 10,
@@ -149,7 +136,6 @@ defmodule Membrane.RTP.AV1.ScalabilityStructureTest do
         pictures: []
       }
 
-      # Should fail validation due to n_s > 7, not size
       assert {:error, :invalid_n_s} = ScalabilityStructure.encode(ss)
     end
 
@@ -207,16 +193,13 @@ defmodule Membrane.RTP.AV1.ScalabilityStructureTest do
     end
 
     test "rejects incomplete binary on decode" do
-      # Header only, no spatial layer data
       assert {:error, :incomplete_spatial_layers} = ScalabilityStructure.decode(<<0x10>>)
     end
 
     test "rejects truncated picture data" do
-      # Valid header and spatial layer, but truncated picture desc
       ss = ScalabilityStructure.simple(1920, 1080)
       {:ok, encoded} = ScalabilityStructure.encode(ss)
 
-      # Truncate last byte
       truncated = binary_part(encoded, 0, byte_size(encoded) - 1)
       assert {:error, :incomplete_picture_desc} = ScalabilityStructure.decode(truncated)
     end
