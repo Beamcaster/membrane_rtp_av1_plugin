@@ -24,7 +24,7 @@ defmodule Membrane.RTP.AV1.MixProject do
     [
       {:membrane_core, "~> 1.0"},
       {:membrane_rtp_plugin, "~> 0.24"},
-      {:membrane_av1_format, git: "git@github.com:maslowalex/membrane_av1_format.git"},
+      {:membrane_av1_format, git: "git@github.com:Beamcaster/membrane_av1_format.git"},
       {:bunch, "~> 1.5"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
