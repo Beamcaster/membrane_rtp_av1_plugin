@@ -1,6 +1,6 @@
-defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
+defmodule Membrane.RTP.AV1.Depayloader do
   @moduledoc """
-  RTP depayloader for AV1 video streams using ExWebRTC-style parsing.
+  RTP depayloader for AV1 video streams.
 
   This element reassembles AV1 temporal units from RTP packets according to
   [RFC 9628: RTP Payload Format for AV1](https://datatracker.ietf.org/doc/rfc9628/).
@@ -47,8 +47,9 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   require Membrane.Logger
 
   alias Membrane.{Buffer, RTP}
-  alias Membrane.RTP.AV1.Format
-  alias Membrane.RTP.AV1.ExWebRTC.{LEB128, Payload}
+  alias Membrane.AV1, as: Format
+  alias Membrane.RTP.AV1.LEB128
+  alias Membrane.RTP.AV1.ExWebRTC.Payload
 
   import Bitwise
 
@@ -249,7 +250,7 @@ defmodule Membrane.RTP.AV1.ExWebRTCDepayloader do
   end
 
   # Get OBU type from first byte of OBU binary
-  defp get_obu_type_from_binary(<<_forbidden::1, obu_type::4, _rest::3, _::binary>>), do: obu_type
+  defp get_obu_type_from_binary(<<_forbidden::1, obu_type::4, _rest_bits::3, _::binary>>), do: obu_type
   defp get_obu_type_from_binary(_), do: -1
 
   defp obu_type_name(@obu_sequence_header), do: "SEQUENCE_HEADER"

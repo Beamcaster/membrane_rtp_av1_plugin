@@ -160,10 +160,6 @@ defmodule Membrane.RTP.AV1.SDP do
   @spec encoding_name() :: String.t()
   def encoding_name, do: @encoding_name
 
-  # Private functions
-
-  # Mapping of AV1 level strings to level-idx values (0-31)
-  # Based on AV1 specification Annex A
   @level_idx_map %{
     "2.0" => 0,
     "2.1" => 1,

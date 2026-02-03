@@ -24,20 +24,19 @@ defmodule Membrane.RTP.AV1.MixProject do
     [
       {:membrane_core, "~> 1.0"},
       {:membrane_rtp_plugin, "~> 0.24"},
-      {:membrane_raw_video_format, "~> 0.4.1"},
+      {:membrane_av1_format, git: "git@github.com:maslowalex/membrane_av1_format.git"},
       {:bunch, "~> 1.5"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:benchee, "~> 1.3", only: :dev, runtime: false},
-      {:stream_data, "~> 1.0", only: :test},
-      {:rav1d_ex, ">= 0.0.0", organization: "beamcaster"}
+      {:stream_data, "~> 1.0", only: :test}
     ]
   end
 
   defp package do
     [
       organization: "beamcaster",
-      licenses: ["MIT"],
+      licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => "https://github.com/membraneframework/membrane_rtp_av1_plugin",
         "AV1 RTP Spec (draft)" => "https://aomediacodec.github.io/av1-rtp-spec/"
