@@ -49,6 +49,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
   alias Membrane.{Buffer, RTP}
   alias Membrane.AV1, as: Format
   alias Membrane.RTP.AV1.LEB128
+  alias Membrane.RTP.AV1.SequenceHeader
   alias Membrane.RTP.AV1.ExWebRTC.Payload
 
   import Bitwise
@@ -120,6 +121,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
             require_sequence_header: boolean(),
             stream_format_sent: boolean(),
             cached_sequence_header: binary() | nil,
+            cached_dimensions: %{width: pos_integer(), height: pos_integer()} | nil,
             sequence_header_generation: non_neg_integer(),
             waiting_for_keyframe: boolean(),
             waiting_for_sequence_header: boolean(),
@@ -146,6 +148,10 @@ defmodule Membrane.RTP.AV1.Depayloader do
       stream_format_sent: false,
       # Sequence header management
       cached_sequence_header: nil,
+      # Dimensions parsed out of the cached sequence header. Populated when a
+      # Sequence Header OBU is cached; required by downstream muxers (notably
+      # MP4 ISOM, which serializes them into the tkhd box).
+      cached_dimensions: nil,
       # Incremented each time sequence header changes (for debugging/tracking)
       sequence_header_generation: 0,
       # True when we've requested a keyframe and are waiting for it
@@ -550,14 +556,28 @@ defmodule Membrane.RTP.AV1.Depayloader do
     end
   end
 
+  # Parse width/height from a complete Sequence Header OBU binary (header byte
+  # included). Returns nil on parse failure rather than raising — downstream
+  # already tolerates nil dimensions, and a malformed SH shouldn't crash the
+  # depayloader.
+  defp parse_dimensions(seq_header_obu) when is_binary(seq_header_obu) do
+    case SequenceHeader.extract_from_obu_stream(seq_header_obu) do
+      {:ok, %{width: _, height: _} = dims} -> dims
+      :not_found -> nil
+    end
+  end
+
   defp handle_sequence_header_received(state, new_seq_header, timestamp) do
     cond do
       # First sequence header ever
       state.cached_sequence_header == nil ->
+        dimensions = parse_dimensions(new_seq_header)
+
         Membrane.Logger.debug("""
         Initial sequence header received and cached
         - Size: #{byte_size(new_seq_header)} bytes
         - Timestamp: #{timestamp}
+        - Dimensions: #{inspect(dimensions)}
         """)
 
         emit_sequence_header_telemetry(1, byte_size(new_seq_header), :initial)
@@ -565,6 +585,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
         %{
           state
           | cached_sequence_header: new_seq_header,
+            cached_dimensions: dimensions,
             sequence_header_generation: 1,
             waiting_for_keyframe: false,
             waiting_for_sequence_header: false,
@@ -575,6 +596,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
       # Sequence header changed (resolution change, profile change, etc.)
       new_seq_header != state.cached_sequence_header ->
         new_generation = state.sequence_header_generation + 1
+        dimensions = parse_dimensions(new_seq_header) || state.cached_dimensions
 
         Membrane.Logger.debug("""
         Sequence header CHANGED - new coded video sequence
@@ -582,6 +604,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
         - New size: #{byte_size(new_seq_header)} bytes
         - Generation: #{state.sequence_header_generation} -> #{new_generation}
         - Frames since last seq header: #{state.frames_since_sequence_header}
+        - Dimensions: #{inspect(dimensions)}
         Note: Decoder may need reinitialization
         """)
 
@@ -590,6 +613,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
         %{
           state
           | cached_sequence_header: new_seq_header,
+            cached_dimensions: dimensions,
             sequence_header_generation: new_generation,
             waiting_for_keyframe: false,
             waiting_for_sequence_header: false,
@@ -942,28 +966,54 @@ defmodule Membrane.RTP.AV1.Depayloader do
   end
 
   defp build_output(temporal_unit, pts, state) do
-    # Send stream format on first output if not already sent
-    format_actions =
-      if not state.stream_format_sent do
-        [stream_format: {:output, %Format{}}]
-      else
-        []
-      end
+    # Send stream format on first output once dimensions are known. We defer
+    # emission until a Sequence Header OBU has been parsed (cached_dimensions
+    # is set) because downstream muxers like Membrane.MP4.Muxer.ISOM reject
+    # subsequent stream-format changes — so the first emitted format must
+    # carry width/height.
+    #
+    # While we wait for dimensions, we must also withhold buffers — emitting
+    # buffers without a preceding stream_format is a Membrane protocol error.
+    # In practice the SH OBU is always present in the same temporal unit that
+    # carries the first keyframe (per AV1 spec), so this only drops content
+    # from incomplete bootstrap windows where we never had a usable keyframe
+    # anyway.
+    cond do
+      state.stream_format_sent ->
+        emit_output(temporal_unit, pts, state, [])
 
-    # Build output with proper sequence header handling
+      is_map(state.cached_dimensions) ->
+        format = %Format{
+          width: state.cached_dimensions.width,
+          height: state.cached_dimensions.height
+        }
+
+        emit_output(temporal_unit, pts, %{state | stream_format_sent: true}, [
+          stream_format: {:output, format}
+        ])
+
+      true ->
+        Membrane.Logger.debug(
+          "Withholding temporal unit — Sequence Header OBU not yet parsed, no dimensions known"
+        )
+
+        {[],
+         %{state | frames_since_sequence_header: state.frames_since_sequence_header + 1}}
+    end
+  end
+
+  defp emit_output(temporal_unit, pts, state, prepend_actions) do
     {buffer_actions, new_state} = build_output_with_sequence_header(temporal_unit, pts, state)
 
-    # Emit telemetry for temporal unit emission
     analysis = analyze_temporal_unit(temporal_unit)
     emit_temporal_unit_telemetry(temporal_unit, analysis)
 
     new_state = %{
       new_state
-      | stream_format_sent: true,
-        frames_since_sequence_header: new_state.frames_since_sequence_header + 1
+      | frames_since_sequence_header: new_state.frames_since_sequence_header + 1
     }
 
-    {format_actions ++ buffer_actions, new_state}
+    {prepend_actions ++ buffer_actions, new_state}
   end
 
   defp emit_temporal_unit_telemetry(temporal_unit, analysis) do
