@@ -213,13 +213,15 @@ defmodule Membrane.RTP.AV1.ScalabilityStructure do
     end
   end
 
+  defp decode_pictures(_, _, _, _), do: {:error, :incomplete_picture_desc}
+
   @doc """
   Creates a simple SS structure for a single spatial layer stream.
   """
   @spec simple(width :: pos_integer(), height :: pos_integer(), opts :: keyword()) :: t()
   def simple(width, height, opts \\ []) do
     frame_rate = Keyword.get(opts, :frame_rate, 30)
-    temporal_layers = Keyword.get(opts, :temporal_layers, 1)
+    temporal_layers = min(Keyword.get(opts, :temporal_layers, 1), 8)
 
     spatial_layers = [%{width: width, height: height, frame_rate: frame_rate}]
 

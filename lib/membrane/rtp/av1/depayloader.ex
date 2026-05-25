@@ -266,7 +266,9 @@ defmodule Membrane.RTP.AV1.Depayloader do
   end
 
   # Get OBU type from first byte of OBU binary
-  defp get_obu_type_from_binary(<<_forbidden::1, obu_type::4, _rest_bits::3, _::binary>>), do: obu_type
+  defp get_obu_type_from_binary(<<_forbidden::1, obu_type::4, _rest_bits::3, _::binary>>),
+    do: obu_type
+
   defp get_obu_type_from_binary(_), do: -1
 
   defp obu_type_name(@obu_sequence_header), do: "SEQUENCE_HEADER"
@@ -330,8 +332,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
 
       emit_keyframe_requested_telemetry(:bootstrap_no_sequence_header)
 
-      {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
-       %{state | waiting_for_keyframe: true}}
+      {[event: {:input, %Membrane.KeyframeRequestEvent{}}], %{state | waiting_for_keyframe: true}}
     else
       {[], state}
     end
@@ -509,13 +510,20 @@ defmodule Membrane.RTP.AV1.Depayloader do
     # For {:obus_and_fragment, ...}, check the complete OBUs for sequence header
     seq_header =
       case extracted_obus do
-        {:obus, obu_list} -> find_sequence_header_in_list(obu_list)
-        {:obus_and_fragment, obu_list, _fragment} -> find_sequence_header_in_list(obu_list)
-        {:fragment_and_obus, _fragment, obu_list} -> find_sequence_header_in_list(obu_list)
+        {:obus, obu_list} ->
+          find_sequence_header_in_list(obu_list)
+
+        {:obus_and_fragment, obu_list, _fragment} ->
+          find_sequence_header_in_list(obu_list)
+
+        {:fragment_and_obus, _fragment, obu_list} ->
+          find_sequence_header_in_list(obu_list)
+
         {:fragment_and_obus_and_fragment, _fragment, obu_list, _trailing} ->
           find_sequence_header_in_list(obu_list)
 
-        {:fragment, _binary} -> nil
+        {:fragment, _binary} ->
+          nil
       end
 
     case seq_header do
@@ -1084,15 +1092,17 @@ defmodule Membrane.RTP.AV1.Depayloader do
 
   defp maybe_request_keyframe(state, reason, message) do
     if state.waiting_for_keyframe do
-      Membrane.Logger.debug("Skipping duplicate keyframe request while waiting for upstream keyframe")
+      Membrane.Logger.debug(
+        "Skipping duplicate keyframe request while waiting for upstream keyframe"
+      )
+
       {[], state}
     else
       Membrane.Logger.warning(message)
       emit_keyframe_requested_telemetry(reason)
 
       # Send KeyframeRequestEvent to :input pad to propagate upstream toward the source.
-      {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
-       %{state | waiting_for_keyframe: true}}
+      {[event: {:input, %Membrane.KeyframeRequestEvent{}}], %{state | waiting_for_keyframe: true}}
     end
   end
 

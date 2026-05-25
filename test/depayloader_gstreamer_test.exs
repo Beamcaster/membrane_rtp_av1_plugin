@@ -15,7 +15,7 @@ defmodule Membrane.RTP.AV1.Depayloader.GStreamerTest do
 
   alias Membrane.RTP.AV1.Depayloader
   alias Membrane.RTP.AV1.Depayloader.State
-  alias Membrane.AV1.LEB128
+  alias Membrane.RTP.AV1.LEB128
   alias Membrane.Buffer
 
   import Membrane.RTP.AV1.TestHelperUtils
