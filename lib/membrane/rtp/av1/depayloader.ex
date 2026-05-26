@@ -165,9 +165,16 @@ defmodule Membrane.RTP.AV1.Depayloader do
       # True after a keyframe (N=1) has been successfully output to decoder
       # Inter frames are dropped until this is true to prevent decoder crashes
       # from missing reference frames
-      keyframe_established: false
+      keyframe_established: false,
+      # Diagnostics for build_output/3 dimension-gate: count of temporal units
+      # dropped because cached_dimensions is still nil, and a one-shot flag so
+      # we only warn once per session when the count crosses the threshold.
+      sh_drop_counter: 0,
+      sh_drop_warned: false
     ]
   end
+
+  @sh_drop_warn_threshold 30
 
   # =============================================================================
   # Membrane Callbacks
@@ -235,6 +242,15 @@ defmodule Membrane.RTP.AV1.Depayloader do
     - Waiting for keyframe: #{state.waiting_for_keyframe}
     - Waiting for seq header: #{state.waiting_for_sequence_header}
     """)
+
+    # While stalled (no SH cached yet), surface OBU types at info level every
+    # 30 packets so we can see what an upstream encoder is actually sending.
+    # Drops to debug once SH is cached.
+    if state.cached_sequence_header == nil and rem(state.sh_drop_counter + 1, 30) == 0 do
+      Membrane.Logger.info(
+        "[av1-depay-stalled] Z=#{av1_payload.z} Y=#{av1_payload.y} W=#{av1_payload.w} N=#{av1_payload.n} obus=#{inspect(obu_types)} payload_size=#{byte_size(av1_payload.payload)}"
+      )
+    end
   end
 
   # List OBU types from extracted OBUs (either list, fragment, or both)
@@ -562,8 +578,17 @@ defmodule Membrane.RTP.AV1.Depayloader do
   # depayloader.
   defp parse_dimensions(seq_header_obu) when is_binary(seq_header_obu) do
     case SequenceHeader.extract_from_obu_stream(seq_header_obu) do
-      {:ok, %{width: _, height: _} = dims} -> dims
-      :not_found -> nil
+      {:ok, %{width: _, height: _} = dims} ->
+        dims
+
+      :not_found ->
+        prefix_size = min(32, byte_size(seq_header_obu))
+
+        Membrane.Logger.warning(
+          "AV1 SH parse failed sh_hex=#{Base.encode16(binary_part(seq_header_obu, 0, prefix_size))} size=#{byte_size(seq_header_obu)}"
+        )
+
+        nil
     end
   end
 
@@ -997,8 +1022,26 @@ defmodule Membrane.RTP.AV1.Depayloader do
           "Withholding temporal unit — Sequence Header OBU not yet parsed, no dimensions known"
         )
 
+        new_counter = state.sh_drop_counter + 1
+
+        sh_drop_warned =
+          if new_counter >= @sh_drop_warn_threshold and not state.sh_drop_warned do
+            Membrane.Logger.warning(
+              "AV1 stream stalled: #{new_counter} temporal units dropped, no dimensions parsed (cached_sequence_header=#{state.cached_sequence_header != nil})"
+            )
+
+            true
+          else
+            state.sh_drop_warned
+          end
+
         {[],
-         %{state | frames_since_sequence_header: state.frames_since_sequence_header + 1}}
+         %{
+           state
+           | frames_since_sequence_header: state.frames_since_sequence_header + 1,
+             sh_drop_counter: new_counter,
+             sh_drop_warned: sh_drop_warned
+         }}
     end
   end
 

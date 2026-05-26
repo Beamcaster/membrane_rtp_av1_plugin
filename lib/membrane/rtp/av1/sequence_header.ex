@@ -128,7 +128,8 @@ defmodule Membrane.RTP.AV1.SequenceHeader do
   end
 
   defp skip_through_operating_points(bits, 1) do
-    # reduced_still_picture_header path: just seq_level_idx[0] (5 bits)
+    # reduced_still_picture_header path: just seq_level_idx[0] (5 bits).
+    # operating_points_cnt_minus_1 is implied 0; no per-op extras.
     {_, bits} = take_bits(bits, 5)
     bits
   end
@@ -136,21 +137,28 @@ defmodule Membrane.RTP.AV1.SequenceHeader do
   defp skip_through_operating_points(bits, 0) do
     {timing_info_present_flag, bits} = take_bits(bits, 1)
 
-    bits =
+    {decoder_model_info_present_flag, buffer_delay_length_minus_1, bits} =
       if timing_info_present_flag == 1 do
         skip_timing_and_decoder_model(bits)
       else
-        # decoder_model_info_present_flag without timing info is always 0 per spec
-        {_decoder_model_info_present_flag, bits} = take_bits(bits, 1)
-        bits
+        # Spec §5.5.1: decoder_model_info_present_flag is implicitly 0 when
+        # timing_info_present_flag is 0 — NO bit is consumed here.
+        {0, 0, bits}
       end
 
-    {_initial_display_delay_present_flag, bits} = take_bits(bits, 1)
+    {initial_display_delay_present_flag, bits} = take_bits(bits, 1)
     {operating_points_cnt_minus_1, bits} = take_bits(bits, 5)
 
-    skip_operating_points(bits, operating_points_cnt_minus_1 + 1)
+    skip_operating_points(
+      bits,
+      operating_points_cnt_minus_1 + 1,
+      decoder_model_info_present_flag,
+      buffer_delay_length_minus_1,
+      initial_display_delay_present_flag
+    )
   end
 
+  # Returns {decoder_model_info_present_flag, buffer_delay_length_minus_1, bits}
   defp skip_timing_and_decoder_model(bits) do
     # num_units_in_display_tick (32) + time_scale (32)
     {_, bits} = take_bits(bits, 32)
@@ -161,38 +169,44 @@ defmodule Membrane.RTP.AV1.SequenceHeader do
     {decoder_model_info_present_flag, bits} = take_bits(bits, 1)
 
     if decoder_model_info_present_flag == 1 do
-      # buffer_delay_length_minus_1(5) + num_units_in_decoding_tick(32)
-      # + buffer_removal_time_length_minus_1(5) + frame_presentation_time_length_minus_1(5)
-      {_, bits} = take_bits(bits, 5 + 32 + 5 + 5)
-      bits
+      # decoder_model_info():
+      #   buffer_delay_length_minus_1            (5)
+      #   num_units_in_decoding_tick             (32)
+      #   buffer_removal_time_length_minus_1     (5)
+      #   frame_presentation_time_length_minus_1 (5)
+      {buffer_delay_length_minus_1, bits} = take_bits(bits, 5)
+      {_, bits} = take_bits(bits, 32 + 5 + 5)
+      {1, buffer_delay_length_minus_1, bits}
     else
-      bits
+      {0, 0, bits}
     end
   end
 
   # uvlc — variable-length unsigned. Read leading 0 bits, then 1, then
-  # leading_zeros bits of value (which we discard).
+  # leading_zeros bits of value (which we discard). Per spec, leading_zeros
+  # can be up to 32; at exactly 32 the value is still 32 bits and MUST be
+  # consumed before returning, otherwise every later read is misaligned.
   defp skip_uvlc(bits), do: skip_uvlc(bits, 0)
+
+  defp skip_uvlc(bits, 32) do
+    {_, bits} = take_bits(bits, 32)
+    bits
+  end
 
   defp skip_uvlc(bits, leading_zeros) do
     {bit, bits} = take_bits(bits, 1)
 
-    cond do
-      bit == 1 ->
-        {_, bits} = take_bits(bits, leading_zeros)
-        bits
-
-      leading_zeros >= 32 ->
-        bits
-
-      true ->
-        skip_uvlc(bits, leading_zeros + 1)
+    if bit == 1 do
+      {_, bits} = take_bits(bits, leading_zeros)
+      bits
+    else
+      skip_uvlc(bits, leading_zeros + 1)
     end
   end
 
-  defp skip_operating_points(bits, 0), do: bits
+  defp skip_operating_points(bits, 0, _dmi, _bdlm1, _iddp), do: bits
 
-  defp skip_operating_points(bits, n) do
+  defp skip_operating_points(bits, n, dmi, bdlm1, iddp) do
     {_operating_point_idc, bits} = take_bits(bits, 12)
     {seq_level_idx, bits} = take_bits(bits, 5)
 
@@ -204,7 +218,41 @@ defmodule Membrane.RTP.AV1.SequenceHeader do
         bits
       end
 
-    skip_operating_points(bits, n - 1)
+    bits = skip_per_op_decoder_model(bits, dmi, bdlm1)
+    bits = skip_per_op_initial_display_delay(bits, iddp)
+
+    skip_operating_points(bits, n - 1, dmi, bdlm1, iddp)
+  end
+
+  defp skip_per_op_decoder_model(bits, 0, _bdlm1), do: bits
+
+  defp skip_per_op_decoder_model(bits, 1, bdlm1) do
+    {present_for_this_op, bits} = take_bits(bits, 1)
+
+    if present_for_this_op == 1 do
+      # operating_parameters_info(op):
+      #   decoder_buffer_delay[op]  (buffer_delay_length_minus_1 + 1 bits)
+      #   encoder_buffer_delay[op]  (same)
+      #   low_delay_mode_flag[op]   (1 bit)
+      bdl = bdlm1 + 1
+      {_, bits} = take_bits(bits, bdl + bdl + 1)
+      bits
+    else
+      bits
+    end
+  end
+
+  defp skip_per_op_initial_display_delay(bits, 0), do: bits
+
+  defp skip_per_op_initial_display_delay(bits, 1) do
+    {present_for_this_op, bits} = take_bits(bits, 1)
+
+    if present_for_this_op == 1 do
+      {_initial_display_delay_minus_1, bits} = take_bits(bits, 4)
+      bits
+    else
+      bits
+    end
   end
 
   # Bitstream helpers — operate on {offset, binary} where offset is the
