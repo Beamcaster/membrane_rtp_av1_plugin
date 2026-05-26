@@ -49,6 +49,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
   alias Membrane.{Buffer, RTP}
   alias Membrane.AV1, as: Format
   alias Membrane.RTP.AV1.LEB128
+  alias Membrane.RTP.AV1.SequenceHeader
   alias Membrane.RTP.AV1.ExWebRTC.Payload
 
   import Bitwise
@@ -120,6 +121,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
             require_sequence_header: boolean(),
             stream_format_sent: boolean(),
             cached_sequence_header: binary() | nil,
+            cached_dimensions: %{width: pos_integer(), height: pos_integer()} | nil,
             sequence_header_generation: non_neg_integer(),
             waiting_for_keyframe: boolean(),
             waiting_for_sequence_header: boolean(),
@@ -146,6 +148,10 @@ defmodule Membrane.RTP.AV1.Depayloader do
       stream_format_sent: false,
       # Sequence header management
       cached_sequence_header: nil,
+      # Dimensions parsed out of the cached sequence header. Populated when a
+      # Sequence Header OBU is cached; required by downstream muxers (notably
+      # MP4 ISOM, which serializes them into the tkhd box).
+      cached_dimensions: nil,
       # Incremented each time sequence header changes (for debugging/tracking)
       sequence_header_generation: 0,
       # True when we've requested a keyframe and are waiting for it
@@ -159,9 +165,16 @@ defmodule Membrane.RTP.AV1.Depayloader do
       # True after a keyframe (N=1) has been successfully output to decoder
       # Inter frames are dropped until this is true to prevent decoder crashes
       # from missing reference frames
-      keyframe_established: false
+      keyframe_established: false,
+      # Diagnostics for build_output/3 dimension-gate: count of temporal units
+      # dropped because cached_dimensions is still nil, and a one-shot flag so
+      # we only warn once per session when the count crosses the threshold.
+      sh_drop_counter: 0,
+      sh_drop_warned: false
     ]
   end
+
+  @sh_drop_warn_threshold 30
 
   # =============================================================================
   # Membrane Callbacks
@@ -229,6 +242,15 @@ defmodule Membrane.RTP.AV1.Depayloader do
     - Waiting for keyframe: #{state.waiting_for_keyframe}
     - Waiting for seq header: #{state.waiting_for_sequence_header}
     """)
+
+    # While stalled (no SH cached yet), surface OBU types at info level every
+    # 30 packets so we can see what an upstream encoder is actually sending.
+    # Drops to debug once SH is cached.
+    if state.cached_sequence_header == nil and rem(state.sh_drop_counter + 1, 30) == 0 do
+      Membrane.Logger.info(
+        "[av1-depay-stalled] Z=#{av1_payload.z} Y=#{av1_payload.y} W=#{av1_payload.w} N=#{av1_payload.n} obus=#{inspect(obu_types)} payload_size=#{byte_size(av1_payload.payload)}"
+      )
+    end
   end
 
   # List OBU types from extracted OBUs (either list, fragment, or both)
@@ -247,6 +269,22 @@ defmodule Membrane.RTP.AV1.Depayloader do
       |> Enum.map(&obu_type_name/1)
 
     obu_types ++ ["FRAGMENT"]
+  end
+
+  defp list_obu_types({:fragment_and_obus, _fragment, obu_list}) do
+    obu_types =
+      Enum.map(obu_list, &get_obu_type_from_binary/1)
+      |> Enum.map(&obu_type_name/1)
+
+    ["FRAGMENT" | obu_types]
+  end
+
+  defp list_obu_types({:fragment_and_obus_and_fragment, _fragment, obu_list, _trailing}) do
+    obu_types =
+      Enum.map(obu_list, &get_obu_type_from_binary/1)
+      |> Enum.map(&obu_type_name/1)
+
+    ["FRAGMENT" | obu_types] ++ ["FRAGMENT"]
   end
 
   # Get OBU type from first byte of OBU binary
@@ -276,6 +314,16 @@ defmodule Membrane.RTP.AV1.Depayloader do
     # Debug logging with extracted OBUs (correct types after LEB128 stripping)
     log_packet_debug(state, av1_payload, raw_obus, timestamp, marker)
 
+    # Some publishers (notably OBS + libaom) join mid-sequence: their first
+    # RTP packet is a middle/last OBU fragment (Z=1) with N=0, so we have no
+    # cached sequence header and no buffered first fragment to reassemble.
+    # The orphan-fragment branches drop the packet silently, but at startup
+    # handle_packet_loss/1 can't escalate to a PLI request (it only does so
+    # if keyframe_established was true). Request a keyframe up front whenever
+    # we have nothing cached yet — the upstream WHIP publisher will respond
+    # with a keyframe + sequence header, unblocking the depayloader.
+    {bootstrap_events, state} = maybe_bootstrap_keyframe_request(state)
+
     # Step 2: Handle N bit (new coded video sequence signal)
     # Per spec section 4.4: N=1 means first packet of coded video sequence
     state = handle_n_bit(state, av1_payload, raw_obus, timestamp)
@@ -289,7 +337,26 @@ defmodule Membrane.RTP.AV1.Depayloader do
 
     # Step 4: Check if we have a complete temporal unit (marker bit set)
     # Note: we use state.current_pts (captured from first packet) not the passed pts
-    maybe_emit_temporal_unit(state, marker)
+    {emit_actions, state} = maybe_emit_temporal_unit(state, marker)
+    {bootstrap_events ++ emit_actions, state}
+  end
+
+  # Bootstrap PLI: request a keyframe if we have never seen a sequence header
+  # and aren't already waiting for one. Idempotent — once waiting_for_keyframe
+  # is set we don't spam more events.
+  defp maybe_bootstrap_keyframe_request(state) do
+    if state.cached_sequence_header == nil and not state.waiting_for_keyframe do
+      Membrane.Logger.info(
+        "No cached sequence header on first usable packet — requesting keyframe (PLI) upstream"
+      )
+
+      emit_keyframe_requested_telemetry(:bootstrap_no_sequence_header)
+
+      {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
+       %{state | waiting_for_keyframe: true}}
+    else
+      {[], state}
+    end
   end
 
   # -----------------------------------------------------------------------------
@@ -299,8 +366,11 @@ defmodule Membrane.RTP.AV1.Depayloader do
   # Extract individual OBUs from RTP payload based on W field
   # Returns:
   #   {:obus, [obu1, obu2, ...]} - Complete OBUs as a list (boundaries preserved)
-  #   {:fragment, binary} - Fragment data (partial OBU, Z=1 continuation)
+  #   {:fragment, binary} - Fragment data (single partial OBU element)
   #   {:obus_and_fragment, [complete_obus], fragment} - Complete OBUs followed by trailing fragment (Y=1)
+  #   {:fragment_and_obus, fragment, [complete_obus]} - Leading continuation fragment followed by complete OBUs (Z=1)
+  #   {:fragment_and_obus_and_fragment, fragment, [complete_obus], trailing_fragment} - Leading continuation
+  #   fragment followed by complete OBUs and a trailing fragment (Z=1, Y=1)
   #
   # W=0: All OBUs have LEB128 length prefix
   # W=1-3: That many OBUs, all but last have LEB128 length prefix
@@ -312,28 +382,17 @@ defmodule Membrane.RTP.AV1.Depayloader do
   defp extract_obus_from_rtp_payload(%{w: w, z: z, y: y, payload: payload}) do
     result =
       cond do
-        # Z=1: This packet starts with a continuation fragment
-        # The entire payload (or first OBU element) is fragment data
         z == 1 ->
-          {:fragment, payload}
+          extract_obus_with_leading_fragment(payload, w, y)
 
         # Y=1, Z=0: Last OBU continues in next packet, but preceding OBUs are complete
         # We need to extract complete OBUs and identify the trailing fragment
         y == 1 and z == 0 ->
           extract_obus_with_trailing_fragment(payload, w)
 
-        # Z=0, Y=0: All OBUs are complete
-        # W=0: Length-prefixed format - all OBUs have LEB128 prefix
-        w == 0 ->
-          {:obus, extract_length_prefixed_obus(payload, [])}
-
-        # W=1: Single OBU, no length prefix (extends to end of packet)
-        w == 1 ->
-          {:obus, [payload]}
-
-        # W=2-3: Multiple OBUs, all but last have LEB128 prefix
-        w in 2..3 ->
-          {:obus, extract_w_obus(payload, w, [])}
+        # Z=0, Y=0: All OBU elements are complete in this packet.
+        w in 0..3 ->
+          {:obus, extract_obu_elements(payload, w)}
 
         true ->
           # Fallback: treat as single OBU
@@ -359,111 +418,51 @@ defmodule Membrane.RTP.AV1.Depayloader do
     {:obus_and_fragment, ensure_obus_have_size_fields(obus), fragment}
   end
 
+  defp normalize_extracted_obus({:fragment_and_obus, fragment, obus}) do
+    {:fragment_and_obus, fragment, ensure_obus_have_size_fields(obus)}
+  end
+
+  defp normalize_extracted_obus({:fragment_and_obus_and_fragment, fragment, obus, trailing}) do
+    {:fragment_and_obus_and_fragment, fragment, ensure_obus_have_size_fields(obus), trailing}
+  end
+
+  defp extract_obus_with_leading_fragment(payload, w, y) do
+    case extract_obu_elements(payload, w) do
+      [] ->
+        {:fragment, payload}
+
+      [fragment] ->
+        {:fragment, fragment}
+
+      [fragment | rest] when y == 0 ->
+        {:fragment_and_obus, fragment, rest}
+
+      [fragment | rest] ->
+        {complete_obus, [trailing_fragment]} = Enum.split(rest, length(rest) - 1)
+        {:fragment_and_obus_and_fragment, fragment, complete_obus, trailing_fragment}
+    end
+  end
+
   # Extract complete OBUs when Y=1 (last OBU is a fragment)
   # Returns {:obus_and_fragment, [complete_obus], fragment} or {:fragment, binary}
   defp extract_obus_with_trailing_fragment(payload, w) do
-    case w do
-      # W=0: All OBUs have LEB128 prefix, extract complete ones
-      0 ->
-        extract_length_prefixed_obus_with_fragment(payload)
-
-      # W=1: Single OBU that's a fragment (no complete OBUs)
-      1 ->
+    case extract_obu_elements(payload, w) do
+      [] ->
         {:fragment, payload}
 
-      # W=2-3: W OBUs total, first W-1 have LEB128 prefix and are complete
-      # Last one (no prefix, extends to end) is fragment
-      w when w in 2..3 ->
-        extract_w_obus_with_fragment(payload, w)
+      [fragment] ->
+        {:fragment, fragment}
 
-      _ ->
-        {:fragment, payload}
+      obus ->
+        {complete_obus, [fragment]} = Enum.split(obus, length(obus) - 1)
+        {:obus_and_fragment, complete_obus, fragment}
     end
   end
 
-  # Extract OBUs in W=0 format when Y=1
-  # All complete OBUs have LEB128 prefix, last partial one may not
-  defp extract_length_prefixed_obus_with_fragment(payload) do
-    {complete_obus, remaining} = extract_complete_length_prefixed_obus(payload, [])
-
-    case {complete_obus, remaining} do
-      # No complete OBUs, entire payload is fragment
-      {[], _} ->
-        {:fragment, payload}
-
-      # Have complete OBUs and remaining fragment
-      {obus, <<>>} ->
-        # Edge case: no remaining data (shouldn't happen with Y=1 but handle gracefully)
-        {:obus, obus}
-
-      {obus, fragment} ->
-        {:obus_and_fragment, obus, fragment}
-    end
-  end
-
-  # Extract complete OBUs until we can't read another complete one
-  # Returns {[complete_obus], remaining_binary}
-  defp extract_complete_length_prefixed_obus(<<>>, acc), do: {Enum.reverse(acc), <<>>}
-
-  defp extract_complete_length_prefixed_obus(data, acc) do
-    case LEB128.read(data) do
-      {:ok, leb_size, obu_length} ->
-        <<_leb::binary-size(leb_size), rest::binary>> = data
-
-        if obu_length <= byte_size(rest) do
-          # Complete OBU - extract and continue
-          <<obu::binary-size(obu_length), remaining::binary>> = rest
-          extract_complete_length_prefixed_obus(remaining, [obu | acc])
-        else
-          # Incomplete OBU - this is the fragment
-          # Return accumulated OBUs and the remaining data (including the LEB128 we just read)
-          {Enum.reverse(acc), data}
-        end
-
-      {:error, _} ->
-        # Can't parse LEB128 - remaining data is fragment
-        {Enum.reverse(acc), data}
-    end
-  end
-
-  # Extract OBUs in W=2-3 format when Y=1
-  # First W-1 OBUs have LEB128 prefix and are complete, last one is fragment
-  defp extract_w_obus_with_fragment(payload, w) do
-    {complete_obus, remaining} = extract_w_complete_obus(payload, w - 1, [])
-
-    case {complete_obus, remaining} do
-      {[], _} ->
-        {:fragment, payload}
-
-      {obus, <<>>} ->
-        {:obus, obus}
-
-      {obus, fragment} ->
-        {:obus_and_fragment, obus, fragment}
-    end
-  end
-
-  # Extract exactly count complete OBUs with LEB128 prefix
-  defp extract_w_complete_obus(data, 0, acc), do: {Enum.reverse(acc), data}
-  defp extract_w_complete_obus(<<>>, _count, acc), do: {Enum.reverse(acc), <<>>}
-
-  defp extract_w_complete_obus(data, count, acc) do
-    case LEB128.read(data) do
-      {:ok, leb_size, obu_length} ->
-        <<_leb::binary-size(leb_size), rest::binary>> = data
-
-        if obu_length <= byte_size(rest) do
-          <<obu::binary-size(obu_length), remaining::binary>> = rest
-          extract_w_complete_obus(remaining, count - 1, [obu | acc])
-        else
-          # Truncated - return what we have
-          {Enum.reverse(acc), data}
-        end
-
-      {:error, _} ->
-        {Enum.reverse(acc), data}
-    end
-  end
+  defp extract_obu_elements(payload, 0), do: extract_length_prefixed_obus(payload, [])
+  defp extract_obu_elements(payload, 1), do: [payload]
+  defp extract_obu_elements(payload, w) when w in 2..3, do: extract_w_obus(payload, w, [])
+  defp extract_obu_elements(payload, _w), do: [payload]
 
   # Extract OBUs in W=0 (length-prefixed) format
   # Each OBU is preceded by LEB128 length
@@ -534,6 +533,10 @@ defmodule Membrane.RTP.AV1.Depayloader do
       case extracted_obus do
         {:obus, obu_list} -> find_sequence_header_in_list(obu_list)
         {:obus_and_fragment, obu_list, _fragment} -> find_sequence_header_in_list(obu_list)
+        {:fragment_and_obus, _fragment, obu_list} -> find_sequence_header_in_list(obu_list)
+        {:fragment_and_obus_and_fragment, _fragment, obu_list, _trailing} ->
+          find_sequence_header_in_list(obu_list)
+
         {:fragment, _binary} -> nil
       end
 
@@ -569,14 +572,37 @@ defmodule Membrane.RTP.AV1.Depayloader do
     end
   end
 
+  # Parse width/height from a complete Sequence Header OBU binary (header byte
+  # included). Returns nil on parse failure rather than raising — downstream
+  # already tolerates nil dimensions, and a malformed SH shouldn't crash the
+  # depayloader.
+  defp parse_dimensions(seq_header_obu) when is_binary(seq_header_obu) do
+    case SequenceHeader.extract_from_obu_stream(seq_header_obu) do
+      {:ok, %{width: _, height: _} = dims} ->
+        dims
+
+      :not_found ->
+        prefix_size = min(32, byte_size(seq_header_obu))
+
+        Membrane.Logger.warning(
+          "AV1 SH parse failed sh_hex=#{Base.encode16(binary_part(seq_header_obu, 0, prefix_size))} size=#{byte_size(seq_header_obu)}"
+        )
+
+        nil
+    end
+  end
+
   defp handle_sequence_header_received(state, new_seq_header, timestamp) do
     cond do
       # First sequence header ever
       state.cached_sequence_header == nil ->
+        dimensions = parse_dimensions(new_seq_header)
+
         Membrane.Logger.debug("""
         Initial sequence header received and cached
         - Size: #{byte_size(new_seq_header)} bytes
         - Timestamp: #{timestamp}
+        - Dimensions: #{inspect(dimensions)}
         """)
 
         emit_sequence_header_telemetry(1, byte_size(new_seq_header), :initial)
@@ -584,6 +610,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
         %{
           state
           | cached_sequence_header: new_seq_header,
+            cached_dimensions: dimensions,
             sequence_header_generation: 1,
             waiting_for_keyframe: false,
             waiting_for_sequence_header: false,
@@ -594,6 +621,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
       # Sequence header changed (resolution change, profile change, etc.)
       new_seq_header != state.cached_sequence_header ->
         new_generation = state.sequence_header_generation + 1
+        dimensions = parse_dimensions(new_seq_header) || state.cached_dimensions
 
         Membrane.Logger.debug("""
         Sequence header CHANGED - new coded video sequence
@@ -601,6 +629,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
         - New size: #{byte_size(new_seq_header)} bytes
         - Generation: #{state.sequence_header_generation} -> #{new_generation}
         - Frames since last seq header: #{state.frames_since_sequence_header}
+        - Dimensions: #{inspect(dimensions)}
         Note: Decoder may need reinitialization
         """)
 
@@ -609,6 +638,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
         %{
           state
           | cached_sequence_header: new_seq_header,
+            cached_dimensions: dimensions,
             sequence_header_generation: new_generation,
             waiting_for_keyframe: false,
             waiting_for_sequence_header: false,
@@ -644,7 +674,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
   # OBU Fragment Handling (Z/Y Bits)
   # -----------------------------------------------------------------------------
 
-  # extracted_obus: {:obus, [list]}, {:fragment, binary}, or {:obus_and_fragment, [list], binary}
+  # extracted_obus can include complete OBUs plus leading/trailing fragments depending on Z/Y.
   defp handle_obu_fragments(state, av1_payload, extracted_obus, timestamp, pts) do
     case {av1_payload.z, av1_payload.y, state.current_obu_fragment} do
       # Z=0, Y=0: Single complete OBU (or multiple complete OBUs)
@@ -685,16 +715,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
 
       # Z=1, Y=0: Last fragment of an OBU
       {1, 0, fragment} when fragment != nil and timestamp == state.current_timestamp ->
-        {:fragment, fragment_data} = extracted_obus
-        complete_obu = fragment <> fragment_data
-        # Normalize the reassembled OBU to ensure it has a size field
-        normalized_obu = ensure_obu_has_size_field(complete_obu)
-
-        state
-        |> reset_obu_fragment()
-        # Use existing current_pts since this is a continuation (not first packet)
-        # Wrap in list for append_obus
-        |> append_obus(timestamp, {:obus, [normalized_obu]}, state.current_pts)
+        finish_fragmented_obu(state, extracted_obus, timestamp)
 
       # Z=1, Y=0: Last fragment but no matching first fragment
       {1, 0, _} ->
@@ -711,8 +732,7 @@ defmodule Membrane.RTP.AV1.Depayloader do
 
       # Z=1, Y=1: Middle fragment of an OBU
       {1, 1, fragment} when fragment != nil and timestamp == state.current_timestamp ->
-        {:fragment, fragment_data} = extracted_obus
-        %{state | current_obu_fragment: fragment <> fragment_data}
+        continue_fragmented_obu(state, extracted_obus, timestamp)
 
       # Z=1, Y=1: Middle fragment but no matching first fragment
       {1, 1, _} ->
@@ -761,6 +781,42 @@ defmodule Membrane.RTP.AV1.Depayloader do
   defp handle_y1_packet(state, {:obus, obu_list}, timestamp, pts) do
     # Edge case: Y=1 but all OBUs turned out to be complete (shouldn't happen but handle gracefully)
     append_obus(state, timestamp, {:obus, obu_list}, pts)
+  end
+
+  defp finish_fragmented_obu(state, {:fragment, fragment_data}, timestamp) do
+    append_completed_fragment(state, timestamp, fragment_data, [])
+  end
+
+  defp finish_fragmented_obu(state, {:fragment_and_obus, fragment_data, obu_list}, timestamp) do
+    append_completed_fragment(state, timestamp, fragment_data, obu_list)
+  end
+
+  defp continue_fragmented_obu(state, {:fragment, fragment_data}, _timestamp) do
+    %{state | current_obu_fragment: state.current_obu_fragment <> fragment_data}
+  end
+
+  defp continue_fragmented_obu(
+         state,
+         {:fragment_and_obus_and_fragment, fragment_data, obu_list, trailing_fragment},
+         timestamp
+       ) do
+    pts = state.current_pts
+
+    state
+    |> append_completed_fragment(timestamp, fragment_data, obu_list)
+    |> start_obu_fragment(timestamp, trailing_fragment, pts)
+  end
+
+  defp append_completed_fragment(state, timestamp, fragment_data, obu_list) do
+    completed_obu = complete_fragmented_obu(state.current_obu_fragment, fragment_data)
+
+    state
+    |> reset_obu_fragment()
+    |> append_obus(timestamp, {:obus, [completed_obu | obu_list]}, state.current_pts)
+  end
+
+  defp complete_fragmented_obu(fragment, fragment_data) do
+    ensure_obu_has_size_field(fragment <> fragment_data)
   end
 
   defp emit_fragment_dropped_telemetry(reason, z, y) do
@@ -935,28 +991,72 @@ defmodule Membrane.RTP.AV1.Depayloader do
   end
 
   defp build_output(temporal_unit, pts, state) do
-    # Send stream format on first output if not already sent
-    format_actions =
-      if not state.stream_format_sent do
-        [stream_format: {:output, %Format{}}]
-      else
-        []
-      end
+    # Send stream format on first output once dimensions are known. We defer
+    # emission until a Sequence Header OBU has been parsed (cached_dimensions
+    # is set) because downstream muxers like Membrane.MP4.Muxer.ISOM reject
+    # subsequent stream-format changes — so the first emitted format must
+    # carry width/height.
+    #
+    # While we wait for dimensions, we must also withhold buffers — emitting
+    # buffers without a preceding stream_format is a Membrane protocol error.
+    # In practice the SH OBU is always present in the same temporal unit that
+    # carries the first keyframe (per AV1 spec), so this only drops content
+    # from incomplete bootstrap windows where we never had a usable keyframe
+    # anyway.
+    cond do
+      state.stream_format_sent ->
+        emit_output(temporal_unit, pts, state, [])
 
-    # Build output with proper sequence header handling
+      is_map(state.cached_dimensions) ->
+        format = %Format{
+          width: state.cached_dimensions.width,
+          height: state.cached_dimensions.height
+        }
+
+        emit_output(temporal_unit, pts, %{state | stream_format_sent: true}, [
+          stream_format: {:output, format}
+        ])
+
+      true ->
+        Membrane.Logger.debug(
+          "Withholding temporal unit — Sequence Header OBU not yet parsed, no dimensions known"
+        )
+
+        new_counter = state.sh_drop_counter + 1
+
+        sh_drop_warned =
+          if new_counter >= @sh_drop_warn_threshold and not state.sh_drop_warned do
+            Membrane.Logger.warning(
+              "AV1 stream stalled: #{new_counter} temporal units dropped, no dimensions parsed (cached_sequence_header=#{state.cached_sequence_header != nil})"
+            )
+
+            true
+          else
+            state.sh_drop_warned
+          end
+
+        {[],
+         %{
+           state
+           | frames_since_sequence_header: state.frames_since_sequence_header + 1,
+             sh_drop_counter: new_counter,
+             sh_drop_warned: sh_drop_warned
+         }}
+    end
+  end
+
+  defp emit_output(temporal_unit, pts, state, prepend_actions) do
     {buffer_actions, new_state} = build_output_with_sequence_header(temporal_unit, pts, state)
 
-    # Emit telemetry for temporal unit emission
     analysis = analyze_temporal_unit(temporal_unit)
     emit_temporal_unit_telemetry(temporal_unit, analysis)
 
     new_state = %{
       new_state
-      | stream_format_sent: true,
-        frames_since_sequence_header: new_state.frames_since_sequence_header + 1
+      | frames_since_sequence_header: new_state.frames_since_sequence_header + 1
     }
 
-    {format_actions ++ buffer_actions, new_state}
+    {prepend_actions ++ buffer_actions, new_state}
   end
 
   defp emit_temporal_unit_telemetry(temporal_unit, analysis) do
@@ -1011,34 +1111,29 @@ defmodule Membrane.RTP.AV1.Depayloader do
     cond do
       # No cached sequence header and we have frame data - can't decode, request keyframe
       state.cached_sequence_header == nil and has_frame_data ->
-        Membrane.Logger.warning("""
-        Cannot output frame - no sequence header available
-        Requesting keyframe (PLI) via upstream event to get sequence header for decoder initialization
-        """)
-
-        # Emit telemetry for keyframe request
-        emit_keyframe_requested_telemetry(:no_sequence_header)
-
-        # Send KeyframeRequestEvent to :input pad to propagate UPSTREAM toward the source
-        # This will eventually reach RTPSource which sends PLI to the WebRTC peer
-        {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
-         %{state | waiting_for_keyframe: true}}
+        maybe_request_keyframe(
+          state,
+          :no_sequence_header,
+          """
+          Cannot output frame - no sequence header available
+          Requesting keyframe (PLI) via upstream event to get sequence header for decoder initialization
+          """
+        )
 
       # CRITICAL: Inter frame arrived before any keyframe was established
       # Decoder has no reference frames yet - outputting would crash decoder
       # This catches the case where we have cached seq header from a previous
       # session but decoder was reset/restarted
       not state.keyframe_established and not is_keyframe and has_frame_data ->
-        Membrane.Logger.warning("""
-        Dropping inter frame - no keyframe has been established yet
-        Decoder needs a keyframe first to initialize reference frames
-        Requesting keyframe (PLI)
-        """)
-
-        emit_keyframe_requested_telemetry(:no_keyframe_established)
-
-        {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
-         %{state | waiting_for_keyframe: true}}
+        maybe_request_keyframe(
+          state,
+          :no_keyframe_established,
+          """
+          Dropping inter frame - no keyframe has been established yet
+          Decoder needs a keyframe first to initialize reference frames
+          Requesting keyframe (PLI)
+          """
+        )
 
       # Keyframe (has sequence header) - output and mark keyframe as established
       is_keyframe and has_frame_data ->
@@ -1078,6 +1173,20 @@ defmodule Membrane.RTP.AV1.Depayloader do
       %{count: 1},
       %{reason: reason}
     )
+  end
+
+  defp maybe_request_keyframe(state, reason, message) do
+    if state.waiting_for_keyframe do
+      Membrane.Logger.debug("Skipping duplicate keyframe request while waiting for upstream keyframe")
+      {[], state}
+    else
+      Membrane.Logger.warning(message)
+      emit_keyframe_requested_telemetry(reason)
+
+      # Send KeyframeRequestEvent to :input pad to propagate upstream toward the source.
+      {[event: {:input, %Membrane.KeyframeRequestEvent{}}],
+       %{state | waiting_for_keyframe: true}}
+    end
   end
 
   defp build_buffer(payload, pts, key_frame?) do
